@@ -14,6 +14,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.OkHttpClient
 import java.net.URI
 
 /**
@@ -68,12 +69,12 @@ class YtmdDesktops(context: Context) {
      * id when it goes. [resolveLock] is shared with the other mDNS lookups, as older Androids take one resolve at a time.
      * Returns what [stopDiscovery] takes, or null when there's no mDNS.
      */
-    fun startDiscovery(scope: CoroutineScope, resolveLock: Mutex, found: (Renderer) -> Unit, lost: (String) -> Unit): NsdManager.DiscoveryListener? {
+    fun startDiscovery(scope: CoroutineScope, http: OkHttpClient, resolveLock: Mutex, found: (Renderer) -> Unit, lost: (String) -> Unit): NsdManager.DiscoveryListener? {
         if (!enabled) return null
         val manager = nsd ?: return null
         val listener = object : NsdManager.DiscoveryListener {
             override fun onServiceFound(info: NsdServiceInfo) {
-                if (info.serviceType.contains("ytmdesktop", ignoreCase = true)) scope.launch(Dispatchers.IO) { resolve(manager, info, resolveLock)?.let(found) }
+                if (info.serviceType.contains("ytmdesktop", ignoreCase = true)) scope.launch(Dispatchers.IO) { resolve(manager, http, info, resolveLock)?.let(found) }
             }
             override fun onServiceLost(info: NsdServiceInfo) = lost(idFor(info.serviceName))
             override fun onDiscoveryStarted(type: String) = Unit
@@ -89,7 +90,7 @@ class YtmdDesktops(context: Context) {
         runCatching { nsd?.stopServiceDiscovery(listener) }
     }
 
-    private suspend fun resolve(manager: NsdManager, info: NsdServiceInfo, lock: Mutex): Renderer? = lock.withLock {
+    private suspend fun resolve(manager: NsdManager, http: OkHttpClient, info: NsdServiceInfo, lock: Mutex): Renderer? = lock.withLock {
         val r = withTimeoutOrNull(6_000) {
             suspendCancellableCoroutine<NsdServiceInfo?> { cont ->
                 runCatching {
@@ -103,11 +104,32 @@ class YtmdDesktops(context: Context) {
         } ?: return@withLock null
         @Suppress("DEPRECATION")
         val all = if (android.os.Build.VERSION.SDK_INT >= 34) r.hostAddresses else listOfNotNull(r.host)
-        // IPv4: YTMD doesn't listen on IPv6.
-        val host = all.firstOrNull { it is java.net.Inet4Address }?.hostAddress ?: return@withLock null
+        // IPv4: YTMD doesn't listen on IPv6. It lists every address the PC has (a VPN's, unplugged adapters' 169.254
+        // ones…), so the one this phone can reach is picked: by network first, then by which one answers.
+        val networks = phoneNetworks()
+        var candidates = rankHosts(all.filterIsInstance<java.net.Inet4Address>().mapNotNull { it.hostAddress }.distinct(), networks)
+        // Before Android 14 that's one address of the PC's, whichever came first (a VPN's, say): when it isn't on this
+        // phone's network, the PC's name is asked for its others (YTMD's instance name is the PC's host name).
+        if (candidates.none { isOnNetworks(it, networks) }) {
+            val more = MdnsAddresses.lookup(r.serviceName)
+            Log.i(TAG, "${r.serviceName}: resolver gave $candidates, the PC's name has $more")
+            candidates = rankHosts((candidates + more).distinct(), networks)
+        }
+        if (candidates.isEmpty()) return@withLock null
         val port = r.port.takeIf { it > 0 } ?: YtmdApi.DEFAULT_PORT
+        val host = candidates.take(MAX_PROBES).firstOrNull { h ->
+            withTimeoutOrNull(PROBE_MS) { runCatching { YtmdApi(http, h, port).metadata() }.isSuccess } == true
+        } ?: candidates.first()
+        com.prism.music.playback.AudioDiagnostics.log("ytmd", "found ${r.serviceName}: $candidates, using $host")
+        Log.i(TAG, "found ${r.serviceName} at $candidates, using $host:$port")
         renderer(r.serviceName, host, port, name = r.serviceName.ifBlank { host }, manual = false)
     }
+
+    /** This phone's IPv4 networks (address and prefix length), for [rankHosts]. */
+    private fun phoneNetworks(): List<Pair<String, Int>> = runCatching {
+        java.net.NetworkInterface.getNetworkInterfaces().toList().filter { it.isUp && !it.isLoopback }
+            .flatMap { i -> i.interfaceAddresses.filter { it.address is java.net.Inet4Address }.mapNotNull { a -> a.address.hostAddress?.let { it to a.networkPrefixLength.toInt() } } }
+    }.getOrDefault(emptyList())
 
     companion object {
         private const val TAG = "PrismYtmd"
@@ -115,6 +137,46 @@ class YtmdDesktops(context: Context) {
         const val PREFIX = "ytmd:"
 
         fun idFor(key: String) = PREFIX + key
+
+        private const val MAX_PROBES = 4
+        private const val PROBE_MS = 2_500L
+
+        /**
+         * A PC's IPv4 [candidates], most likely to reach first: on one of the phone's own [networks] (address, prefix
+         * length), then private LAN addresses (10/8, 172.16/12, 192.168/16), then the rest (a VPN's 100.64/10), and
+         * link-local (169.254/16, an adapter with no network) and loopback last.
+         */
+        fun rankHosts(candidates: List<String>, networks: List<Pair<String, Int>>): List<String> {
+            fun rank(a: String): Int {
+                val n = ipv4Bits(a) ?: return 9
+                val o1 = (n ushr 24).toInt(); val o2 = ((n ushr 16) and 0xFF).toInt()
+                return when {
+                    o1 == 127 -> 5
+                    o1 == 169 && o2 == 254 -> 4
+                    isOnNetworks(a, networks) -> 0
+                    o1 == 192 && o2 == 168 -> 1
+                    o1 == 10 || (o1 == 172 && o2 in 16..31) -> 2
+                    else -> 3
+                }
+            }
+            return candidates.filter { ipv4Bits(it) != null }.sortedBy(::rank)
+        }
+
+        /** Whether IPv4 [address] is on one of [networks] (address, prefix length). */
+        fun isOnNetworks(address: String, networks: List<Pair<String, Int>>): Boolean {
+            val a = ipv4Bits(address) ?: return false
+            return networks.any { (net, prefix) ->
+                val b = ipv4Bits(net) ?: return@any false
+                val p = prefix.coerceIn(0, 32)
+                if (p == 0 || p == 32) return@any false
+                val mask = (0xFFFFFFFFL shl (32 - p)) and 0xFFFFFFFFL
+                a and mask == b and mask
+            }
+        }
+
+        private fun ipv4Bits(a: String): Long? = a.split('.').takeIf { it.size == 4 }
+            ?.map { it.toIntOrNull()?.takeIf { n -> n in 0..255 } ?: return null }
+            ?.fold(0L) { acc, n -> (acc shl 8) or n.toLong() }
 
         fun renderer(key: String, host: String, port: Int, name: String, manual: Boolean) = Renderer(
             id = idFor(key),

@@ -1000,12 +1000,11 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
         if (!ytmdDesktops.enabled) return null
         ytmdDesktops.manual().forEach { r -> found[r.id] = r to SystemClock.elapsedRealtime(); castListed["ytmd/" + r.id] = r.id }
         publishFound()
-        return ytmdDesktops.startDiscovery(scope, resolveLock,
+        return ytmdDesktops.startDiscovery(scope, c.http, resolveLock,
             found = { r -> castListed["ytmd/" + r.id] = r.id; found[r.id] = r to SystemClock.elapsedRealtime(); publishFound() },
-            lost = { id ->
-                castListed.remove("ytmd/$id")
-                if (id != (state.value as? CastState.Casting)?.renderer?.id && found.remove(id) != null) publishFound()
-            },
+            // YTMD only answers lookups (it never announces itself), so Android calls it lost once its answer is old:
+            // it's kept until prune() forgets it, as SSDP speakers are, rather than vanishing while the picker's open.
+            lost = { id -> castListed.remove("ytmd/$id") },
         )
     }
 
@@ -1043,9 +1042,16 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
             val why = runCatching {
                 api.metadata()
                 api.token = ytmdDesktops.token(r)
-                // A token it no longer takes (Prism was removed from its list) is asked for again.
-                if (api.token != null && runCatching { api.state() }.exceptionOrNull().let { it is com.prism.music.ytmd.YtmdException && (it.code == 401 || it.code == 403) }) {
-                    ytmdDesktops.forgetToken(r); api.token = null
+                // One look at its state, which /state allows every 5 s (a second one at once was refused, 429). A token
+                // it no longer takes (Prism was removed from its list) is asked for again.
+                var answered = false
+                if (api.token != null) {
+                    val e = runCatching { api.state() }.exceptionOrNull()
+                    when {
+                        e == null -> answered = true
+                        e is com.prism.music.ytmd.YtmdException && (e.code == 401 || e.code == 403) -> { ytmdDesktops.forgetToken(r); api.token = null }
+                        else -> throw e
+                    }
                 }
                 if (api.token == null) {
                     val code = api.requestCode()
@@ -1053,9 +1059,10 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
                     _events.tryEmit(tr(R.string.ytmd_approve_toast, code))
                     try { ytmdDesktops.saveToken(r, api.requestToken(code)) } finally { _ytmdCode.value = null }
                 }
-                api.state()
+                if (!answered) api.state()
             }.fold({ null }, { e ->
                 Log.w(TAG, "couldn't connect to ${r.name}", e)
+                com.prism.music.playback.AudioDiagnostics.log("ytmd", "couldn't connect to ${r.location}: $e")
                 if (e is CancellationException) throw e
                 if (e is com.prism.music.ytmd.YtmdException && (e.code == 401 || e.code == 403)) tr(R.string.ytmd_not_allowed, r.name) else tr(R.string.ytmd_cant_reach, r.name)
             })

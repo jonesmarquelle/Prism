@@ -63,7 +63,9 @@ class YtmdCast(
     /** The song last sent, and when: until the PC says it has it, what it reports is about the one before. */
     private var sentId: String? = null
     private var sentAt = 0L
-    private var lastCommandAt = 0L
+    @Volatile private var lastCommandAt = 0L
+    /** A song sent to the PC that it's being got to start: until then, its being paused isn't the PC's own pause. */
+    @Volatile private var starting: String? = null
     private var lastSeekAt = 0L
     private var lastFollowAt = 0L
     private var volumeSetAt = 0L
@@ -96,11 +98,15 @@ class YtmdCast(
         return s.progressMs + if (s.playing) SystemClock.elapsedRealtime() - lastAt else 0
     }
 
+    private var volumeJob: Job? = null
+
+    /** While it's dragged, only where it ends up goes (YTMD takes two commands a second). */
     fun setVolume(level: Int) {
         val v = level.coerceIn(0, 100)
         volume = v
         volumeSetAt = SystemClock.elapsedRealtime()
-        send("volume") { api.setVolume(v) }
+        volumeJob?.cancel()
+        volumeJob = scope.launch { delay(VOLUME_SETTLE_MS); send("volume") { api.setVolume(v) } }
     }
 
     // ------------------------------------------------------------ What the PC says
@@ -112,7 +118,7 @@ class YtmdCast(
             val token = api.token ?: return
             val rt = YtmdRealtime(api.host, api.port, token)
             realtime = rt
-            val ok = runCatching { rt.run(onConnected = { failingSince = 0L }) { st -> failingSince = 0L; scope.launch { onState(st) } } }
+            val ok = runCatching { rt.run(onConnected = { failingSince = 0L }) { st -> failingSince = 0L; if (worthTelling(st)) scope.launch { onState(st) } } }
             if (closed) return
             val e = ok.exceptionOrNull()
             if (e is YtmdException && (e.code == 401 || e.code == 403)) { scope.launch { lost(tr(R.string.ytmd_not_allowed, renderer.name)) }; return }
@@ -127,9 +133,34 @@ class YtmdCast(
                     if (failingSince == 0L) failingSince = SystemClock.elapsedRealtime()
                     if (SystemClock.elapsedRealtime() - failingSince > GIVE_UP_MS) { scope.launch { lost(tr(R.string.lost_the_connection_to, renderer.name)) }; return }
                 }
-                delay(if ((r.exceptionOrNull() as? YtmdException)?.code == 429) 5_000 else POLL_MS)
+                delay(POLL_MS)
             }
         }
+    }
+
+    // Read on the feed's thread only.
+    private var told: YtmdState? = null
+    private var toldAt = 0L
+    private var heard = 0
+    private var heardSince = 0L
+
+    /**
+     * Whether an update from the feed goes to [onState]. YTMD sends one on every change of its player, its playhead's
+     * several times a second among them, and the phone only follows that every few seconds: its playhead's taken at most
+     * once a second, anything else (another song, played / paused, the volume, an ad) at once.
+     */
+    private fun worthTelling(st: YtmdState): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        heard++
+        if (now - heardSince >= 60_000) {
+            if (heardSince != 0L) Log.d(TAG, "${renderer.name}: $heard updates in ${(now - heardSince) / 1000} s")
+            heard = 0; heardSince = now
+        }
+        val t = told
+        val tell = t == null || now - toldAt >= TELL_EVERY_MS || st.videoId != t.videoId || st.trackState != t.trackState ||
+            st.volume != t.volume || st.adPlaying != t.adPlaying || st.title != t.title
+        if (tell) { told = st; toldAt = now }
+        return tell
     }
 
     private fun onState(st: YtmdState) {
@@ -146,6 +177,7 @@ class YtmdCast(
         if (st.videoId != here) { onForeign(p, st, now); return }
         foreignId = null
         if (sentId == here && now - sentAt < SETTLE_MS && st.buffering) return
+        if (starting == here) return
         // Played or paused on the PC (its own buttons, a media key there): the phone does the same.
         if (now - lastCommandAt > GRACE_MS) {
             if (st.paused && p.playWhenReady) { fromPc = false; c.player.setPlaying(false); return }
@@ -214,12 +246,24 @@ class YtmdCast(
         sentAt = SystemClock.elapsedRealtime()
         val play = p.playWhenReady
         send("changeVideo") {
-            api.changeVideo(song.id)
-            // It starts playing from the top: once it has the song, it goes where the phone is, and pauses if the phone is.
-            if (startMs > 1_500 || !play) {
-                withTimeoutOrNull(6_000) { while (last?.videoId != song.id) delay(150) }
+            starting = song.id
+            try {
+                api.changeVideo(song.id)
+                // It plays from the top: once it has the song, it goes where the phone is, and pauses if the phone is.
+                val arrived = withTimeoutOrNull(ARRIVE_MS) { while (last?.videoId != song.id) delay(150) } != null
+                if (!arrived) Log.i(TAG, "${renderer.name} hasn't said it has ${song.id} yet")
                 if (startMs > 1_500) api.seek(startMs)
-                if (!play) api.pause()
+                if (!play) { api.pause(); return@send }
+                // A YTMD that hasn't played anything since it opened loads the song but doesn't start it (the browser's
+                // autoplay rule): it's told to play.
+                val started = withTimeoutOrNull(START_MS) { while (last?.let { it.videoId == song.id && it.playing } != true) delay(150) } != null
+                if (!started) {
+                    Log.i(TAG, "${renderer.name} didn't start ${song.id}: play sent")
+                    lastCommandAt = SystemClock.elapsedRealtime()
+                    api.play()
+                }
+            } finally {
+                if (starting == song.id) starting = null
             }
         }
     }
@@ -266,13 +310,20 @@ class YtmdCast(
 
     companion object {
         private const val TAG = "PrismYtmd"
-        private const val POLL_MS = 1_500L
+        /** YTMD allows /state once every 5 s ([YtmdApi.STATE_EVERY_MS] keeps to it): this is while the feed's down. */
+        private const val POLL_MS = 5_500L
+        private const val VOLUME_SETTLE_MS = 250L
         private const val POLL_SPELL_MS = 20_000L
         private const val GIVE_UP_MS = 15_000L
         /** After a song's sent, this long for the PC to load it before what it says counts. */
         private const val SETTLE_MS = 5_000L
         /** After a command from here, this long before a play / pause on the PC is taken as its own. */
         private const val GRACE_MS = 3_000L
+        /** For the PC to have a song sent, and then to be playing it (before it's told to). */
+        private const val ARRIVE_MS = 8_000L
+        private const val START_MS = 2_000L
         private const val FOLLOW_SLACK_MS = 1_500L
+        /** The PC's playhead, from its feed, at most this often. */
+        private const val TELL_EVERY_MS = 1_000L
     }
 }
