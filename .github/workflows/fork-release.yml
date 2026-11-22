@@ -36,6 +36,8 @@ jobs:
     env:
       UPSTREAM_REPO: Yigder/Prism
       GH_TOKEN: ${{ github.token }}
+      # On a fork, gh otherwise picks the parent repo for `gh release` / `gh pr` (run 2 tried to publish to Yigder/Prism).
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
         with:
