@@ -37,17 +37,43 @@ pairing. The PC's firewall has to let the phone reach port 9863.
 | Tests | `app/src/test/java/com/prism/music/ytmd/YtmdTest.kt` |
 
 Upstream files are touched only where the output hooks in: `connect/Cast.kt` (discovery, connect, the player's
-events), `connect/Upnp.kt` (the `YTMD` kind), `ui/player/PlayerControls.kt` (two lines) and `app/build.gradle.kts`
-(the `YTMD` build flag).
+events), `connect/Upnp.kt` (the `YTMD` kind), `ui/player/PlayerControls.kt` (two lines), `data/Updates.kt` (where
+updates come from) and `app/build.gradle.kts` (the `YTMD`, `UPDATE_REPO` and `forkRevision` build settings).
 
-## Keeping up with upstream
+## Updates: upstream's, with the fork kept
 
-`.github/workflows/upstream-sync.yml` runs daily: it merges Yigder/Prism's `main` into this fork's `main` on the
-`upstream-sync` branch and opens a pull request (with the conflicts to resolve when there are any). It needs
-**Settings → Actions → General → Allow GitHub Actions to create and approve pull requests** turned on. By hand:
+Prism's in-app update banner asks **this fork's** releases, not upstream's (`BuildConfig.UPDATE_REPO`, in
+`data/Updates.kt`). `.github/workflows/fork-release.yml` makes them:
+
+1. Every 6 hours it checks upstream's latest release (say `v1.8.7.7`). If the fork hasn't got it, it merges that tag
+   into `main`. Because the fork's code is in its own files, this is normally a clean merge.
+2. If `main` has anything the fork's last release lacks (upstream's release, or a fork change pushed to `main`), it
+   builds a signed release APK and publishes it as **`v1.8.7.7.1`** with `Prism.apk` attached, along with upstream's
+   release notes. A later fork-only fix becomes `.2`, and so on.
+3. The phone's updater sees `1.8.7.7.1` as newer than what's installed, offers it, downloads it and installs it in
+   place, the same as a normal Prism update.
+
+If upstream's release doesn't merge cleanly, nothing is released. Instead a pull request named "Merge upstream Prism
+vX" is opened with the conflicts. Resolve and merge it, and the next run releases. You can start a run any time from
+**Actions → Fork release → Run workflow**.
+
+### One-time setup
+
+- **A signing key.** Every release has to be signed with the same key, or Android refuses to install one over another.
+  Make a keystore once (`keytool -genkeypair -keystore prism-fork.jks -alias prism -keyalg RSA -keysize 4096 -validity 20000`)
+  and keep it somewhere safe. Then add these repository secrets under **Settings → Secrets and variables → Actions**:
+  `SIGNING_KEYSTORE_B64` (`base64 -w0 prism-fork.jks`), `SIGNING_STORE_PASSWORD`, `SIGNING_KEY_ALIAS` and
+  `SIGNING_KEY_PASSWORD`.
+- **Switching from official Prism.** Official Prism is signed with its developer's key, so the fork can't be installed
+  over it. Back up first (Settings → Backup & about → Backup), uninstall Prism, install the fork's `Prism.apk` from this repo's
+  releases, and restore the backup. After that, updates come from the fork in place.
+- If upstream ever adds files under `.github/workflows/`, the workflow can't push that merge (`GITHUB_TOKEN` may not
+  change workflows). Merge that one release by hand.
+
+By hand, the merge is:
 
 ```bash
 git remote add upstream https://github.com/Yigder/Prism.git
-git fetch upstream
-git merge upstream/main
+git fetch upstream --tags
+git merge v1.8.7.7
 ```
