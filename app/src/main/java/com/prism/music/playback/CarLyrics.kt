@@ -47,6 +47,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.text.BreakIterator
@@ -128,8 +129,13 @@ class LyricsOverlayPlayer(player: Player) : ForwardingSimpleBasePlayer(player) {
     override fun handleSeek(mediaItemIndex: Int, positionMs: Long, seekCommand: Int): com.google.common.util.concurrent.ListenableFuture<*> {
         val order = shown
         val real = if (order != null && mediaItemIndex in order.indices) order[mediaItemIndex] else mediaItemIndex
+        // 1.8.8 "Blend when I skip": Next, Previous and a jump in the queue may be taken over (the song heard carries on).
+        if (skipHook?.invoke(real, seekCommand) == true) return com.google.common.util.concurrent.Futures.immediateVoidFuture()
         return super.handleSeek(real, positionMs, seekCommand)
     }
+
+    /** A skip to a place in the queue ([Player] command [seekCommand]); true when it was taken over ([SkipFade.press]). */
+    var skipHook: ((index: Int, seekCommand: Int) -> Boolean)? = null
 
     override fun getState(): State {
         var s = super.getState()
@@ -514,10 +520,15 @@ class CarState(private val context: Context, private val scope: CoroutineScope, 
         registered = false
     }
 
+    /** One look at a time, in order: a slow first look finishing after a car's broadcast would undo what it said. */
+    private val looking = kotlinx.coroutines.sync.Mutex()
+
     fun update() {
         scope.launch {
-            val now = automotive || withContext(Dispatchers.IO) { carMode() || projecting() }
-            if (now != driving) { driving = now; onChange() }
+            looking.withLock {
+                val now = automotive || withContext(Dispatchers.IO) { carMode() || projecting() }
+                if (now != driving) { driving = now; onChange() }
+            }
         }
     }
 

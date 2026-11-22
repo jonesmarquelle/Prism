@@ -78,6 +78,8 @@ class PrismApp : Application(), coil3.SingletonImageLoader.Factory {
                 coil3.disk.DiskCache.Builder()
                     .directory(File(context.cacheDir, "image_cache").absolutePath.toPath())
                     .maxSizePercent(0.02)
+                    // #535: a TV box has 8 GB in all; pictures keep to less there.
+                    .apply { if (com.prism.music.ui.tv.TvDevice.isTv(context)) maximumMaxSizeBytes(com.prism.music.data.TvCacheRoom.IMAGES) }
                     .build()
             }
             .build()
@@ -303,12 +305,14 @@ class AppContainer(val app: Application) {
      */
     @Volatile var returningUser: Boolean? = null
 
-    /** Settings → About → "Take the tour": the activity shows the whole tour. */
-    val tourRequests = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 1)
-
-    /** Asks for notifications once ever, when Prism may not post them yet and is on screen to ask. */
+    /**
+     * Asks for notifications once ever, when Prism may not post them yet and is on screen to ask. Never over a coach tour
+     * (1.8.8: First steps' like downloads the song, and Android's prompt covered the next step); not marked asked then,
+     * so a later download asks.
+     */
     fun askNotifications() {
         if (android.os.Build.VERSION.SDK_INT < 33 || com.prism.music.data.Notifications.allowed(app)) return
+        if (com.prism.music.ui.tour.TourAnchors.running) return
         val prefs = app.getSharedPreferences("prompts", android.content.Context.MODE_PRIVATE)
         if (prefs.getBoolean("notifications_asked", false)) return
         val prompt = notificationPrompt ?: return
@@ -496,8 +500,15 @@ class AppContainer(val app: Application) {
             maxBytes = { (settings.current.offlineGb * 1_073_741_824.0).toLong() - smartPickBytes },
             favoured = { id -> runCatching { id in library.likedIds.value }.getOrDefault(false) },
             totalBytes = { (settings.current.offlineGb * 1_073_741_824.0).toLong() },
+            // #535: on a TV box (8 GB in all) the song cache keeps to what the box can spare.
+            roomCap = { used -> if (isTv) com.prism.music.data.TvCacheRoom.songCache(freeSpace(), used) else Long.MAX_VALUE },
         )
     }
+    /** #535: a TV (Android TV / Google TV): the caches keep to [com.prism.music.data.TvCacheRoom]'s smaller rooms. */
+    val isTv: Boolean by lazy { com.prism.music.ui.tv.TvDevice.isTv(app) }
+    private val freeSpace by lazy { com.prism.music.data.TvCacheRoom.FreeSpace { app.cacheDir.usableSpace } }
+    /** Recently played animated covers and loops together. */
+    private val canvasRecentBytes: Long get() = if (isTv) com.prism.music.data.TvCacheRoom.CANVAS else 400L * 1024 * 1024
     val playerCache: SimpleCache by lazy {
         SimpleCache(File(app.cacheDir, "song_cache"), cacheEvictor, databaseProvider)
     }
@@ -537,7 +548,18 @@ class AppContainer(val app: Application) {
     /** Big data files downloaded on first use (the Japanese reading dictionary, Sing's model). */
     val models = com.prism.music.data.ModelStore(app, http)
     /** Playlists and saved albums kept on the phone (no account needed). */
-    val prismLibrary = com.prism.music.data.PrismLibrary(java.io.File(app.filesDir, "library"))
+    val prismLibrary = com.prism.music.data.PrismLibrary(java.io.File(app.filesDir, "library")).also { lib ->
+        lib.onDeleted = { id -> scope.launch(kotlinx.coroutines.Dispatchers.IO) { runCatching { transitions.forgetPlaylist(id) } } }
+    }
+    /**
+     * The listener's own transitions between two songs of a playlist (1.8.8, Mix it yourself): read when the queue's
+     * playlist is asked about, never at start. Made once, it clears out rows unused for a year.
+     */
+    val transitions by lazy {
+        com.prism.music.data.TransitionStore(db.transitions(), scope).also { s ->
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) { runCatching { s.prune() } }
+        }
+    }
     /** The listener's own tags on songs (1.8.3). */
     val tags by lazy { com.prism.music.data.TagStore(db, scope, java.io.File(app.filesDir, "library")) }
     /** Smart playlists' songs (1.8.3): asked for when one opens, never at start. */
@@ -626,6 +648,11 @@ class AppContainer(val app: Application) {
         // 1.8.3: a restored backup's tags, read in once (a file check otherwise).
         scope.launch(Dispatchers.IO) {
             if (java.io.File(app.filesDir, "library/" + com.prism.music.data.TagStore.PENDING).isFile) tags.readPending()
+        }
+        // 1.8.8: a restored backup's transitions (they go with the Library), read in once (a file check otherwise).
+        scope.launch(Dispatchers.IO) {
+            val f = java.io.File(app.filesDir, "library/" + com.prism.music.data.TransitionStore.PENDING)
+            if (f.isFile) transitions.readPending(f)
         }
         // GitHub #182: bringing the library over had starred every library song's artist; those come off once, unless the
         // account follows them. Retried on a later launch when the account's follows couldn't be asked for.
@@ -1218,13 +1245,13 @@ class AppContainer(val app: Application) {
     }
 
     /** Animated-cover clips on the phone: recently played, and saved (from the player, by album, or with downloads). */
-    val canvasStore by lazy { com.prism.music.data.canvas.CanvasStore(app, http, canvas, ytm, databaseProvider, scope) }
+    val canvasStore by lazy { com.prism.music.data.canvas.CanvasStore(app, http, canvas, ytm, databaseProvider, scope, recentMaxBytes = canvasRecentBytes) }
     /** 1.8.6: Canvas loops cut from music videos, kept as small files (recent ones in the cache, downloads' for good). */
     val clipFiles by lazy {
         com.prism.music.data.canvas.ClipFiles(File(app.cacheDir, "canvas_clips"), File(app.filesDir, "canvas_clips")) {
             // One 400 MB for everything recent that Canvas keeps (the settings say so): loops get what the animated covers leave,
-            // never under 100 MB.
-            (400L * 1024 * 1024 - canvasStore.recentBytes).coerceAtLeast(100L * 1024 * 1024)
+            // never under 100 MB. #535: on a TV, one 128 MB, never under 32 MB.
+            (canvasRecentBytes - canvasStore.recentBytes).coerceAtLeast(canvasRecentBytes / 4)
         }
     }
     val canvasClips by lazy {
@@ -1261,5 +1288,23 @@ class AppContainer(val app: Application) {
 
     fun clearSongCache() {
         runCatching { playerCache.keys.toList().forEach { playerCache.removeResource(it) } }
+    }
+
+    /**
+     * #535: every cache Prism keeps, for "Clear cache": songs kept from streaming (not Smart Downloads' picks, which are
+     * downloads), pictures, recently played animated covers and loops, pictures made for sharing.
+     */
+    val caches by lazy {
+        val share = File(app.cacheDir, "share")
+        fun images() = runCatching { coil3.SingletonImageLoader.get(app).diskCache }.getOrNull()
+        com.prism.music.data.AppCaches(
+            listOf(
+                com.prism.music.data.AppCaches.Part("songs", ::songCacheBytes, ::clearSongCache),
+                com.prism.music.data.AppCaches.Part("pictures", { images()?.size ?: 0L }, { images()?.clear() }),
+                com.prism.music.data.AppCaches.Part("animated covers", { canvasStore.recentBytes }, { canvasStore.clearRecent() }),
+                com.prism.music.data.AppCaches.Part("loops", { clipFiles.recentBytes }, { clipFiles.clearRecent() }),
+                com.prism.music.data.AppCaches.Part("shared pictures", { com.prism.music.data.AppCaches.dirBytes(share) }, { com.prism.music.data.AppCaches.emptyDir(share) }),
+            ),
+        )
     }
 }

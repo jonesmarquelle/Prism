@@ -497,6 +497,12 @@ data class MixPrefs(
     val keepAlbums: Boolean = false,
     /** Tempo analysis (a 1–4 MB download per song) may use mobile data, not only Wi-Fi. */
     val tempoOnCellular: Boolean = false,
+    /**
+     * 1.8.8 (plan-mix §3.2): "Automix", the fourth Crossfade choice. With [on], Prism picks a DJ-style move for each pair
+     * of songs (bass swap, filter out, echo out, cut on the beat, or a blend); it implies [auto] and beat matching. Off by
+     * default; Crossfade's Off keeps it, for when Crossfade comes back.
+     */
+    val automix: Boolean = false,
 )
 
 /** Home: its sections, header, greeting tiles and buttons (1.8.7: moved out of [AppSettings] into a group of their own). */
@@ -560,6 +566,11 @@ data class LyricsPrefs(
     val progressLine: Boolean = true,
     /** A glass button beside Sing under the open lyrics: where they come from; a tap picks another source (1.7.9). */
     val sourceButton: Boolean = false,
+    /**
+     * Sing's button under the open lyrics (Reddit, 1.8.8: a switch to hide it). On as it comes: it hides a button that's
+     * there today. Sing itself stays in the player's menu and buttons.
+     */
+    val singButton: Boolean = true,
     val scale: Float = 1f,
     /** Lyrics are looked up on mobile data as each song starts; off, only once the lyrics are opened (#95). */
     val onMobileData: Boolean = true,
@@ -857,7 +868,7 @@ enum class PlayerPart(val label: String) {
     LYRIC_LINE(tr(R.string.current_lyric)), PROGRESS(tr(R.string.progress_bar)), TIMES(tr(R.string.times)),
     QUALITY(tr(R.string.stream_quality)), BEST_PART(tr(R.string.best_part)), PREV_NEXT(tr(R.string.previous_and_next)),
     /** Shown only while Crossfade is on (Settings → Sound): the mark where the next song comes in, and the covers blending. */
-    CROSSFADE_MARK(tr(R.string.crossfade_mark)), BLEND_COVERS(tr(R.string.covers_blend_too)),
+    CROSSFADE_MARK(tr(R.string.crossfade_mark)), BLEND_COVERS(tr(R.string.cover_and_title_blend_too)),
     SHUFFLE_REPEAT(tr(R.string.shuffle_repeat)), VOLUME(tr(R.string.volume)), BUTTONS(tr(R.string.buttons)),
     OUTPUT(tr(R.string.output_device)), NAV_BAND(tr(R.string.band_behind_the_navigation_buttons));
 
@@ -1053,6 +1064,11 @@ data class SoundPrefs(
      * Downloads ("Use your own song files"). Off by default; doesn't need lossless playback.
      */
     val ownLossyFiles: Boolean = false,
+    /**
+     * 1.8.8 (#481, plan-mix §2): "Blend when I skip". Next, Previous and a tap in the queue blend into the chosen song over
+     * 1.5 s instead of cutting, and a new queue fades out over 200 ms. Off by default; works with Crossfade off too.
+     */
+    val skipBlend: Boolean = false,
 )
 
 /** The longest fixed crossfade, in seconds (#351; it was 12). [com.prism.music.playback.MixEngine] and its tail player are good for it. */
@@ -2052,6 +2068,7 @@ class SettingsRepository(
         val lyricsBlur = booleanPreferencesKey("lyrics_blur")
         val lyricsProgressLine = booleanPreferencesKey("lyrics_progress_line")
         val lyricsSourceButton = booleanPreferencesKey("lyrics_source_button")
+        val lyricsSingButton = booleanPreferencesKey("lyrics_sing_button")
         val backdrops = stringPreferencesKey("backdrops")
         val backdropDim = floatPreferencesKey("backdrop_dim")
         val backdropMotion = booleanPreferencesKey("backdrop_motion")
@@ -2115,6 +2132,8 @@ class SettingsRepository(
         val mixBeatMatch = booleanPreferencesKey("mix_beat_match")
         val mixKeepAlbums = booleanPreferencesKey("mix_keep_albums")
         val mixTempoOnCellular = booleanPreferencesKey("mix_tempo_cellular")
+        /** 1.8.8 ([MixPrefs.automix]). */
+        val mixAutomix = booleanPreferencesKey("mix_automix")
         val contentCountry = stringPreferencesKey("content_country")
         val videoMaxHeight = intPreferencesKey("video_max_height")
         val cacheSizeMb = intPreferencesKey("cache_size_mb")
@@ -2420,6 +2439,8 @@ class SettingsRepository(
         val pauseFade = booleanPreferencesKey("pause_fade")
         /** 1.8.1 (#314, [SoundPrefs.ownLossyFiles]). */
         val ownLossyFiles = booleanPreferencesKey("own_lossy_files")
+        /** 1.8.8 ([SoundPrefs.skipBlend]). */
+        val skipBlend = booleanPreferencesKey("skip_blend")
         val performanceMode = booleanPreferencesKey("performance_mode")
         /** The Home card offering Performance mode on a slower phone was answered (either way). */
         val performanceOffered = booleanPreferencesKey("performance_offered")
@@ -2528,6 +2549,10 @@ class SettingsRepository(
                 "skip_silence_episodes", "sleep_fade", "pause_fade",
                 // 1.8.1 (#314): your own song files in place of the stream.
                 "own_lossy_files",
+                // 1.8.8 (#481): how a skip sounds, not a look.
+                "skip_blend",
+                // 1.8.8 (plan-mix §3.2): Automix, how songs meet, as the other mix keys.
+                "mix_automix",
                 // 1.8.1 (#216): what plays and shows, not a look.
                 "explicit_content",
                 // 1.8.2 (#349): where Home's Quick picks come from.
@@ -2557,6 +2582,8 @@ class SettingsRepository(
                 "supported",
                 // 1.8.7.6: where a canvas comes from (Spotify, with the listener's own sign-in), and its one-time offer.
                 "canvas_spotify_first", "canvas_spotify_offered",
+                // 1.8.8: whether Sing's button shows on the lyrics is how you use Sing, not a look.
+                "lyrics_sing_button",
             )
         }
     }
@@ -2806,6 +2833,7 @@ class SettingsRepository(
                 sleepFadeSeconds = (p[K.sleepFade] ?: d.sound.sleepFadeSeconds).coerceIn(0, 60),
                 pauseFade = p[K.pauseFade] ?: d.sound.pauseFade,
                 ownLossyFiles = p[K.ownLossyFiles] ?: d.sound.ownLossyFiles,
+                skipBlend = p[K.skipBlend] ?: d.sound.skipBlend,
             ),
             behavior = BehaviorPrefs(
                 lockPortrait = p[K.lockPortrait] ?: d.behavior.lockPortrait,
@@ -2901,6 +2929,7 @@ class SettingsRepository(
                 beatMatch = p[K.mixBeatMatch] ?: d.mix.beatMatch,
                 keepAlbums = p[K.mixKeepAlbums] ?: d.mix.keepAlbums,
                 tempoOnCellular = p[K.mixTempoOnCellular] ?: d.mix.tempoOnCellular,
+                automix = p[K.mixAutomix] ?: d.mix.automix,
             ),
             home = HomePrefs(
                 layout = p[K.homeLayout]?.let {
@@ -2951,6 +2980,7 @@ class SettingsRepository(
                 blur = p[K.lyricsBlur] ?: d.lyrics.blur,
                 progressLine = p[K.lyricsProgressLine] ?: d.lyrics.progressLine,
                 sourceButton = p[K.lyricsSourceButton] ?: d.lyrics.sourceButton,
+                singButton = p[K.lyricsSingButton] ?: d.lyrics.singButton,
                 scale = p[K.lyricsScale] ?: d.lyrics.scale,
                 onMobileData = p[K.lyricsOnMobileData] ?: d.lyrics.onMobileData,
                 align = p.enum(K.lyricsAlign, d.lyrics.align),
@@ -3432,6 +3462,7 @@ class SettingsRepository(
     fun setLyricsBlur(v: Boolean) = edit { it[K.lyricsBlur] = v }
     fun setLyricsProgressLine(v: Boolean) = edit { it[K.lyricsProgressLine] = v }
     fun setLyricsSourceButton(v: Boolean) = edit { it[K.lyricsSourceButton] = v }
+    fun setLyricsSingButton(v: Boolean) = edit { it[K.lyricsSingButton] = v }
     fun setBackdrops(v: Map<String, String>) = edit { it[K.backdrops] = json.encodeToString<Map<String, String>>(v) }
     fun setBackdropDim(v: Float) = edit { it[K.backdropDim] = v }
     fun setBackdropMotion(v: Boolean) = edit { it[K.backdropMotion] = v }
@@ -3494,6 +3525,7 @@ class SettingsRepository(
     fun setMixBeatMatch(v: Boolean) = edit { it[K.mixBeatMatch] = v }
     fun setMixKeepAlbums(v: Boolean) = edit { it[K.mixKeepAlbums] = v }
     fun setMixTempoOnCellular(v: Boolean) = edit { it[K.mixTempoOnCellular] = v }
+    fun setMixAutomix(v: Boolean) = edit { it[K.mixAutomix] = v }
     fun setContentCountry(v: String) = edit { it[K.contentCountry] = v }
     fun setSkipSilence(v: Boolean) = edit { it[K.skipSilence] = v }
     fun setVideoMaxHeight(v: Int) = edit { it[K.videoMaxHeight] = v }
@@ -3856,6 +3888,7 @@ class SettingsRepository(
     fun setSleepFade(v: Int) = edit { it[K.sleepFade] = v.coerceIn(0, 60) }
     fun setPauseFade(v: Boolean) = edit { it[K.pauseFade] = v }
     fun setOwnLossyFiles(v: Boolean) = edit { it[K.ownLossyFiles] = v }
+    fun setSkipBlend(v: Boolean) = edit { it[K.skipBlend] = v }
     fun setLyricsStripAlign(v: LyricsAlign) = edit { it[K.lyricsStripAlign] = v.name }
     fun setLyricsStripTwoLines(v: Boolean) = edit { it[K.lyricsStripTwoLines] = v }
     fun setMergeLikedVideos(v: Boolean) = edit { it[K.mergeLikedVideos] = v }

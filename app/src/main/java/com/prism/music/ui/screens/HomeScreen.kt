@@ -297,7 +297,7 @@ fun HomeScreen(bottomPadding: androidx.compose.ui.unit.Dp) {
     val lastHome by produceState(homeShelfCache.value.ifEmpty { null }) {
         if (value == null) value = c.homeCache.read()?.also { if (homeShelfCache.value.isEmpty()) homeShelfCache.value = it }
     }
-    val moods = rememberLoad("moods") { c.taste.rank(runCatching { c.ytm.moodsAndGenres() }.getOrDefault(emptyList())) }
+    val moods = rememberLoad(c.ytm.moodsLoadKey()) { c.taste.rank(runCatching { c.ytm.moodsAndGenres() }.getOrDefault(emptyList())) }
     LaunchedEffect(signIn) { if (signInChanged) home.reload(false) }
     val recent by c.library.recent.collectAsState()
     val liked by c.library.likedShown.collectAsState()
@@ -457,8 +457,9 @@ fun HomeScreen(bottomPadding: androidx.compose.ui.unit.Dp) {
         LazyColumn(Modifier.fillMaxSize(), state = list, contentPadding = PaddingValues(bottom = bottomPadding + 16.dp)) {
             item { HomeTopBar() }
             item(key = "update") { UpdateBanner() }
-            item(key = "performance") { PerformanceOffer() }
-            item(key = "smartDownloads") { SmartDownloadsOffer(smartAnswered) { smartAnswered = true } }
+            // 1.8.8 (plan-tour.md D11): neither offer while a new install's First steps is still to come.
+            item(key = "performance") { if (!com.prism.music.ui.tour.FirstSteps.offersWait()) PerformanceOffer() }
+            item(key = "smartDownloads") { if (!com.prism.music.ui.tour.FirstSteps.offersWait()) SmartDownloadsOffer(smartAnswered) { smartAnswered = true } }
             // 1.8.7.6: the 100-hour card, never beside another offer (one ask at a time).
             item(key = "support") {
                 com.prism.music.ui.support.SupportHomeCard(otherOffer = performanceOfferShows() || smartAnswered != true && settings.onboarded)
@@ -481,9 +482,15 @@ fun HomeScreen(bottomPadding: androidx.compose.ui.unit.Dp) {
                             // what you've just heard). Your recent plays themselves never do: that's Recently played.
                             // A pick starts a radio from it (#38), as on YouTube Music, unless Customize Home says to play them in order.
                             // Offline: the songs on the phone you're most likely to want, played in order.
-                            if (!online) { if (offlinePicks.isNotEmpty()) SongSection(cfg, cfg.titled(tr(R.string.quick_picks)), tr(R.string.ready_offline), offlinePicks, snap = true) }
+                            val firstPick = com.prism.music.ui.tour.TourAnchor.QUICK_PICK // where the coach points first (1.8.8)
+                            // First steps' D12: the song put in the mini player when step 1 is passed with Next.
+                            // The first one shown: with "Hide explicit" that's not always the list's first.
+                            if (com.prism.music.ui.tour.TourAnchors.running) com.prism.music.ui.tour.FirstSteps.QuickPick(
+                                com.prism.music.ui.tour.FirstSteps.firstShown(settings.behavior.explicitContent, if (online) pickSongs else offlinePicks),
+                            )
+                            if (!online) { if (offlinePicks.isNotEmpty()) SongSection(cfg, cfg.titled(tr(R.string.quick_picks)), tr(R.string.ready_offline), offlinePicks, snap = true, firstAnchor = firstPick) }
                             else if (pickSongs.isNotEmpty()) SongSection(
-                                cfg, cfg.titled(tr(R.string.quick_picks)), picks?.strapline, pickSongs, snap = true,
+                                cfg, cfg.titled(tr(R.string.quick_picks)), picks?.strapline, pickSongs, snap = true, firstAnchor = firstPick,
                                 play = if (settings.quickPicksRadio) { list, i -> c.player.playRadio(list[i]) } else null,
                             )
                         }
@@ -770,8 +777,10 @@ private fun HomeTopRow(greeting: String, today: String, showGreeting: Boolean) {
             com.prism.music.ui.components.RoundAction(PrismIcons.Customize, tr(R.string.customize_home_2)) { nav.go(Routes.CATALOGUE) }
         }
         Spacer(Modifier.width(8.dp))
+        // 1.8.8: with no Settings tab in the bar, this is where the coach's "Everything can look your way" points.
+        val settingsMark = if (com.prism.music.data.prefs.NavTab.SETTINGS in settings.navTabs) null else com.prism.music.ui.tour.TourAnchor.SETTINGS_TAB
         com.prism.music.ui.screens.ProfilePicture(
-            Modifier.size(42.dp).clickable(onClickLabel = tr(R.string.settings)) { nav.go(Routes.SETTINGS) }, description = tr(R.string.settings),
+            Modifier.size(42.dp).then(settingsMark?.mark ?: Modifier).clickable(onClickLabel = tr(R.string.settings)) { nav.go(Routes.SETTINGS) }, description = tr(R.string.settings),
         )
     }
 }
@@ -986,6 +995,8 @@ internal fun SongSection(
     snap: Boolean = false,
     /** What tapping a song does; null plays the section from it. */
     play: ((List<Song>, Int) -> Unit)? = null,
+    /** The coach's mark on the first song (Quick picks, List and Grid). */
+    firstAnchor: com.prism.music.ui.tour.TourAnchor? = null,
     onMore: (() -> Unit)? = null,
 ) {
     val c = LocalContainer.current
@@ -1003,7 +1014,7 @@ internal fun SongSection(
             GridCells.Fixed(if (songs.size > 2) 2 else 1), Modifier.height(if (songs.size > 2) 2 * 212.dp else 212.dp),
             contentPadding = PaddingValues(horizontal = 12.dp),
         ) {
-            items(songs.size) { i -> ItemCard(SongItem(songs[i]), width = 140.dp) { start(i) } }
+            items(songs.size) { i -> ItemCard(SongItem(songs[i]), (if (i == 0) firstAnchor?.mark else null) ?: Modifier, width = 140.dp) { start(i) } }
         }
         SectionStyle.LIST -> {
             val grid = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
@@ -1022,7 +1033,7 @@ internal fun SongSection(
             ) {
                 items(songs.size) { i ->
                     // The song playing is marked, as in a playlist (#242: Quick picks never showed it).
-                    Box(Modifier.width(330.dp)) { SongRow(songs[i], playing = current?.id == songs[i].id) { start(i) } }
+                    Box(Modifier.width(330.dp).then((if (i == 0) firstAnchor?.mark else null) ?: Modifier)) { SongRow(songs[i], playing = current?.id == songs[i].id) { start(i) } }
                 }
             }
         }

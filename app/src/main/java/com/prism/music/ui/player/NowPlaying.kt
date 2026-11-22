@@ -307,7 +307,13 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
     val context = LocalContext.current
     val view = LocalView.current
     val settings by c.settings.flow.collectAsState()
-    val song = pc.currentSong.collectAsState().value ?: return
+    val playing = pc.currentSong.collectAsState().value ?: return
+    // 1.8.8 "Blend when I skip": the chosen song is shown at once (its cover, title and loop) while the one heard fades out;
+    // the main player, and with it the lyrics, moves to it as the fade ends. Read through derivedStateOf: the blend's
+    // progress changes every few ms and the screen isn't recomposed for that.
+    val blendState = c.mixState.blend.collectAsState()
+    val skippingTo by remember(playing.id) { derivedStateOf { skipShownId(playing.id, blendState.value) } }
+    val song = remember(playing, skippingTo) { skippingTo?.let { id -> pc.queue.value.firstOrNull { it.song.id == id }?.song } ?: playing }
     val isPlaying by pc.isPlaying.collectAsState()
     val buffering by pc.buffering.collectAsState()
     val videoMode by pc.videoMode.collectAsState()
@@ -318,7 +324,7 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
 
     // #280: "Reopen on the last page". Nothing's read or written with it off.
     val pageMemory = remember(settings.behavior.playerRemembersPage) { if (settings.behavior.playerRemembersPage) PlayerPageMemory(view.context) else null }
-    val opensOn = remember { pageMemory?.opensOn(song.isEpisode) ?: PlayerPage.COVER }
+    val opensOn = remember { pageMemory?.opensOn(playing.isEpisode) ?: PlayerPage.COVER }
     // Opened on a page, its controls start as opening that page would start them ("Full screen" hides them).
     val openPanelControls = opensOn == PlayerPage.COVER || settings.view.panelPlayer != com.prism.music.data.prefs.PanelPlayer.HIDDEN
     var lyricsOpen by rememberSaveable { mutableStateOf(opensOn == PlayerPage.LYRICS) }
@@ -348,9 +354,9 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
     // Settings → Player → Layout (1.7.4); a wide player (tablet, landscape) keeps its own.
     val wideNow = com.prism.music.ui.theme.LocalWindowLayout.current.let { it.twoPanePlayer || it.shortLandscape || it.tabletop }
     val layout = if (wideNow) com.prism.music.data.prefs.PlayerLayout.STANDARD else settings.player.layout
-    val lyricsState = rememberLyricsState(song, opened = lyricsOpen || settings.immersivePlayer || showProviders || layout == com.prism.music.data.prefs.PlayerLayout.LYRICS)
+    val lyricsState = rememberLyricsState(playing, opened = lyricsOpen || settings.immersivePlayer || showProviders || layout == com.prism.music.data.prefs.PlayerLayout.LYRICS)
     // With the lyrics in, the best part can start where a line does (or come from the chorus, without a heat curve).
-    LaunchedEffect(song.id, lyricsState.lyrics) { if (lyricsState.lyrics?.synced == true) c.bestParts.refine(song) }
+    LaunchedEffect(playing.id, lyricsState.lyrics) { if (lyricsState.lyrics?.synced == true) c.bestParts.refine(playing) }
     // The playhead is read only where it's shown (the scrubber), so the player isn't recomposed as the song plays.
     val position = rememberPositionState(fast = false, hold = covered)
     val pastStart by remember { derivedStateOf { position.value > 3000 } }
@@ -407,8 +413,8 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
     val openLyrics = { lyricsControlsOpen = controlsAtOpen; lyricsOpen = true; queueOpen = false; statsOpen = false }
     val closeLyrics = { lyricsControlsOpen = false; lyricsOpen = false }
     // #215: a recognized song played opens on its lyrics (taken once, by that song).
-    LaunchedEffect(PlayerAsks.lyricsFor, song.id) {
-        if (PlayerAsks.lyricsFor == song.id) { PlayerAsks.lyricsFor = null; openLyrics() }
+    LaunchedEffect(PlayerAsks.lyricsFor, playing.id) {
+        if (PlayerAsks.lyricsFor == playing.id) { PlayerAsks.lyricsFor = null; openLyrics() }
     }
     val toggleQueue = {
         val opening = !queueOpen
@@ -443,7 +449,8 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
     LaunchedEffect(videoChips) { if (videoChips) { delay(5000); videoChips = false } }
     // Lyrics layout: each song opens on its lyrics once they're in (a song without any stays on the cover).
     val hasLyrics = lyricsState.lyrics != null
-    LaunchedEffect(song.id, hasLyrics, layout) {
+    if (com.prism.music.ui.tour.TourAnchors.running) com.prism.music.ui.tour.TourSignals.Player(lyricsOpen, lyricsState.forTour) // the coach (1.8.8)
+    LaunchedEffect(playing.id, hasLyrics, layout) {
         if (layout == com.prism.music.data.prefs.PlayerLayout.LYRICS && hasLyrics && !queueOpen && !statsOpen && !lyricsOpen) openLyrics()
     }
 
@@ -516,7 +523,7 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
         onDispose { activity?.setPipEligible(false) }
     }
     if (videoMode && (fullscreenVideo || sidewaysFull || inPip)) {
-        FullscreenVideo(song, forceLandscape = fullscreenVideo && !inPip, pip = inPip, onExit = { leaveFullscreenVideo() })
+        FullscreenVideo(playing, forceLandscape = fullscreenVideo && !inPip, pip = inPip, onExit = { leaveFullscreenVideo() })
         return
     }
 
@@ -642,7 +649,7 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
     val canvasFades = canvasControlsMayFade(
         fullScreen = canvasBehind, hasCanvas = canvas != null, keepControls = canvasPrefs.keepControls, playing = isPlaying,
         covered = covered, panelOpen = lyricsOpen || queueOpen || statsOpen, dragging = volume.dragging,
-        screenReader = screenReader, reduceMotion = settings.reduceMotion,
+        screenReader = screenReader, reduceMotion = settings.reduceMotion, coachRunning = com.prism.music.ui.tour.TourAnchors.running,
     )
     // Canvas was on before 1.8.6 and music videos were never decided: asked once, here (either answer is kept).
     if (canvasAsksOnce(settings.behavior.canvas.enabled, remember(settings) { c.settings.canvasVideosAnswered }, playerOpen = !lyricsOpen && !queueOpen && !statsOpen)) {
@@ -855,8 +862,8 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
             com.prism.music.data.prefs.PlayerBackground.MESH -> {
                 if (fullBlur < 1f) ArtworkMeshBackdrop(
                     mesh, Modifier.graphicsLayer { alpha = 1f - fullBlur }, seam = if (heroMode) heroHeight else 0.dp,
-                    // Held still under a sheet, like everything else that moves here.
-                    speed = if (covered) 0f else settings.meshSpeed, intensity = settings.meshIntensity, blur = settings.player.blur,
+                    // Held still under a sheet, like everything else that moves here: where it is, not back at rest (#547).
+                    speed = settings.meshSpeed, held = covered, intensity = settings.meshIntensity, blur = settings.player.blur,
                 )
                 if (fullBlur > 0f) FullArtworkBlurBackdrop(blurImage, Modifier.graphicsLayer { alpha = fullBlur })
             }
@@ -908,7 +915,8 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
         if (canvasBehind) canvas?.takeIf { !collapsePastHalf }?.let { clip ->
             CanvasPlayer(
                 clip, canvasSaved, isPlaying, Modifier.fillMaxSize(), hold = covered,
-                presentationAlpha = { (1f - 2f * p()).coerceIn(0f, 1f) },
+                // 1.8.8 (plan-mix §2.4): with a blend under way, the loop comes and goes with the sound.
+                presentationAlpha = { (1f - 2f * p()).coerceIn(0f, 1f) * canvasBlendAlpha(blendState.value, song.id) },
                 onCoverChanged = { canvasBehindShown = it },
             )
             // Darkened under the type: lighter while the controls are away, stronger under the lyrics and the queue.
@@ -969,7 +977,7 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
                     clip, canvasSaved, isPlaying,
                     Modifier.fillMaxWidth().height(heroHeight),
                     bottomFade = heroFade,
-                    presentationAlpha = { heroT.value * (1f - 2f * p()).coerceIn(0f, 1f) },
+                    presentationAlpha = { heroT.value * (1f - 2f * p()).coerceIn(0f, 1f) * canvasBlendAlpha(blendState.value, song.id) },
                     onCoverChanged = { canvasCover = it },
                 )
             }
@@ -1292,7 +1300,7 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
                             if (!videoMode && !coverAway) BlendingCover(song.id, Modifier.fillMaxSize())
                             }
                             if (!heroMode && !videoMode && !canvasBehind && !vinyl && !cassette && !coverAway) canvas?.takeIf { !collapsePastHalf }?.let { clip ->
-                                CanvasPlayer(clip, canvasSaved, isPlaying, Modifier.fillMaxSize(), onCoverChanged = { canvasCover = it })
+                                CanvasPlayer(clip, canvasSaved, isPlaying, Modifier.fillMaxSize(), presentationAlpha = { canvasBlendAlpha(blendState.value, song.id) }, onCoverChanged = { canvasCover = it })
                             }
                         }
                         seekFlash?.takeIf { !collapsePastHalf }?.let { f ->
@@ -1341,15 +1349,22 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
                             layout != com.prism.music.data.prefs.PlayerLayout.MINIMAL && layout != com.prism.music.data.prefs.PlayerLayout.COVER &&
                             !lyricsOpen && !queueOpen && !statsOpen
                         if (centred) Spacer(Modifier.width(if (heartBelow) TITLE_BUTTONS_WIDTH - LIKE_GLYPH_ROOM else TITLE_BUTTONS_WIDTH))
-                        Column(
+                        val scrolls = collapse.value < 0.01f && !covered && settings.player.titleScroll
+                        // "Cover and title blend too" (1.8.8): the song before's title and artist fade out over the new ones.
+                        val titleFrom = blendingFrom(song.id)
+                        TitleBlend(
+                            titleFrom?.second, centred,
                             Modifier.weight(1f).graphicsLayer {
                                 val s = 1f - 0.2f * p()
                                 scaleX = s; scaleY = s
                                 transformOrigin = TransformOrigin(if (centred) 0.5f else 0f, 0.5f)
                             },
-                            horizontalAlignment = if (centred) Alignment.CenterHorizontally else Alignment.Start,
+                            old = {
+                                val before = com.prism.music.data.SongVersions.shownOf(titleFrom!!.first)
+                                if (inHeader(PlayerPart.TITLE)) PlayerMarquee(before.title, titleStyle, Color.White, false)
+                                if (inHeader(PlayerPart.ARTIST)) PlayerMarquee(before.artistText, artistStyle, Color.White.copy(alpha = 0.6f), false)
+                            },
                         ) {
-                            val scrolls = collapse.value < 0.01f && !covered && settings.player.titleScroll
                             // With the ⋯ button hidden (1.8.0), a long press on the title or the artist opens the menu.
                             val menuHeld: (() -> Unit)? = if (settings.shows(PlayerPart.MENU)) null else ({ showActions = true })
                             // #328: the title, artists and album of the version picked to play in its place, if any.
@@ -1396,7 +1411,7 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
                         }
                         val isLiked = song.id in liked
                         if (!heartBelow && inHeader(PlayerPart.LIKE) && !song.isRss) {
-                            CircleGlyph(if (isLiked) PrismIcons.HeartFilled else PrismIcons.Heart, if (isLiked) tr(R.string.remove_from_liked) else tr(R.string.widget_like), isLiked) {
+                            CircleGlyph(if (isLiked) PrismIcons.HeartFilled else PrismIcons.Heart, if (isLiked) tr(R.string.remove_from_liked) else tr(R.string.widget_like), isLiked, com.prism.music.ui.tour.TourAnchor.PLAYER_LIKE.mark) {
                                 c.library.toggleLike(song)
                             }
                             Spacer(Modifier.width(8.dp))
@@ -1509,7 +1524,7 @@ fun NowPlayingScreen(onCollapse: () -> Unit) {
                         val deckGap = if (tightDeck) 8.dp else if (roomyCover) 12.dp else 18.dp
                         // With the lyrics open: Sing's one button at their lower right (1.7.8, V; their source is a line
                         // at their end), and the source as a button at the lower left when asked for (1.7.9).
-                        if (lyricsOpen) LyricsButtonsRow(song, lyricsState, onChangeSource = { showProviders = true }, onNeedsDownload = { showSing = true }, modifier = Modifier.padding(bottom = 6.dp))
+                        if (lyricsOpen) LyricsButtonsRow(playing, lyricsState, onChangeSource = { showProviders = true }, onNeedsDownload = { showSing = true }, modifier = Modifier.padding(bottom = 6.dp))
                         // Minimal: play, and gestures for the rest (the lyrics and queue still have the whole deck).
                         if (layout == com.prism.music.data.prefs.PlayerLayout.MINIMAL && !lyricsOpen && !queueOpen && !statsOpen) {
                             MinimalPlay(isPlaying, buffering)
@@ -1768,19 +1783,11 @@ internal fun SeekLabel(f: SeekFlash, modifier: Modifier) {
  */
 @Composable
 private fun BlendingCover(songId: String, modifier: Modifier) {
-    val c = LocalContainer.current
-    val settings = com.prism.music.ui.theme.LocalAppSettings.current
-    if (!settings.view.blendCovers) return
-    val blend by c.mixState.blend.collectAsState()
-    val now = blend?.takeIf { it.toId == songId } ?: return
-    val queue by c.player.queue.collectAsState()
-    val from = remember(now.fromId) { queue.firstOrNull { it.song.id == now.fromId }?.song } ?: return
-    val alpha = if (settings.reduceMotion) (if (now.progress < 0.5f) 1f else 0f) else 1f - now.progress
-    if (alpha <= 0f) return
-    coil3.compose.AsyncImage(
-        hiRes(from.thumbnail, 1200), null, contentScale = ContentScale.Crop,
-        modifier = modifier.graphicsLayer { this.alpha = alpha },
-    )
+    // 1.8.8: on skip-blends too ([blendingFrom]); its alpha read in the layer, not on every step of the blend.
+    val (from, over) = blendingFrom(songId) ?: return
+    BlendOver(over, modifier) {
+        coil3.compose.AsyncImage(hiRes(from.thumbnail, 1200), null, contentScale = ContentScale.Crop, modifier = Modifier.matchParentSize())
+    }
 }
 
 /**

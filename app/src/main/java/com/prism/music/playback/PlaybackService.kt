@@ -127,6 +127,11 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
     private val headphoneEq = ParametricEqProcessor()
     /** Skip silence for songs: their start and end only (#210); episodes keep Media3's skipper. */
     private val edges = EdgeSilenceProcessor()
+    /**
+     * Automix's effects on the song playing (1.8.8, plan-mix §3.3.2): after the silence trimmer (its song time counts
+     * what that left out) and before the EQ. With no transition under way it copies the sound through untouched.
+     */
+    private val transitionFx = TransitionFx(shiftMs = { edges.skippedMs })
     private val spatial = SpatialAudioProcessor()
     /** "Pause when muted" (#157). */
     private val muteWatch by lazy { MuteWatch(this, player) { c.settings.current.behavior.pauseOnMute } }
@@ -209,7 +214,7 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
                     // was left out (#210).
                     .setAudioProcessorChain(
                         EdgeSilenceProcessor.Chain(
-                            edges, arrayOf(vocals, edges, headphoneEq, spatial, normalizer, androidx.media3.exoplayer.audio.TeeAudioProcessor(VisualizerTap)),
+                            edges, arrayOf(vocals, edges, transitionFx, headphoneEq, spatial, normalizer, androidx.media3.exoplayer.audio.TeeAudioProcessor(VisualizerTap)),
                         )
                     )
                     .build()
@@ -427,6 +432,24 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
                 )
             }
         }
+        // 1.8.8 "Blend when I skip" (#481): every skip comes through here, the session player's and Prism's own buttons'.
+        skipFade = SkipFade(
+            main = player,
+            buildHead = { item -> buildTailPlayer(ShiftProcessor(), startingGain(item, player.currentTimeline) ?: normalizeGainDb) },
+            firstSoundMs = { id -> c.mixTempo.cached(id)?.firstSoundMs ?: 0L },
+            on = { c.settings.current.sound.skipBlend },
+            light = { c.settings.current.performanceMode || (getSystemService(POWER_SERVICE) as? android.os.PowerManager)?.isPowerSaveMode == true },
+            allowed = ::maySkipBlend,
+            warm = { item, isNext -> isNext || item.mediaId.startsWith(Song.LOCAL_PREFIX) || c.availableOffline(item.mediaId) },
+            held = { c.cast.casting || togetherNow() },
+            speed = { musicSpeed },
+            pitch = ::pitchNow,
+            curve = { c.settings.current.sound.crossfadeCurve },
+            state = c.mixState,
+            onSettled = ::restoreMusicSpeed,
+        )
+        sessionPlayer.skipHook = { index, command -> sessionSkipKind(command)?.let { skipFade.press(it, index) } == true }
+        if (com.prism.music.BuildConfig.DEBUG) PlaybackServices.skipFadeForTest = skipFade
         mix = MixEngine(
             main = player,
             scope = scope,
@@ -454,7 +477,19 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
             pitch = ::pitchNow,
             curve = { c.settings.current.sound.crossfadeCurve },
             state = c.mixState,
+            skip = skipFade,
+            // 1.8.8 Mix it yourself: a playlist's own transitions, from memory (the store follows the queue's playlist).
+            playlist = { c.queue.source.value.takeIf { it.kind == QueueKind.PLAYLIST }?.originId },
+            custom = { playlist, from, to -> c.transitions.cached(playlist, from, to) },
+            customPlayed = { playlist, from, to -> c.transitions.used(playlist, from, to) },
+            // 1.8.8 Automix: its effects on both players, the move picked by the songs' scans, keys and shapes.
+            // Crossfade's fourth choice (Settings → Playback → Crossfade → Automix).
+            automix = { c.settings.current.mix.let { it.on && it.automix } },
+            mainFx = transitionFx,
+            buildFxTail = { shift, fx -> buildTailPlayer(shift, normalizeGainDb, fx) },
+            shapeOf = { id -> c.waves.shape(id) },
         ).also { it.start() }
+        if (com.prism.music.BuildConfig.DEBUG) PlaybackServices.mixForTest = mix
         // Prism Connect: the speaker or TV being cast to plays what this player plays, and its volume is the session's.
         sessionPlayer.remote = object : LyricsOverlayPlayer.Remote {
             override val volume: Int? get() = if (c.cast.casting) c.cast.volume else null
@@ -484,6 +519,36 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
     }
 
     private lateinit var mix: MixEngine
+    private lateinit var skipFade: SkipFade
+
+    /** How a skip asked through the session player goes ([LyricsOverlayPlayer.skipHook]); null for a move inside the song. */
+    private fun sessionSkipKind(command: Int): SkipKind? = when (command) {
+        Player.COMMAND_SEEK_TO_NEXT, Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> SkipKind.NEXT
+        Player.COMMAND_SEEK_TO_PREVIOUS, Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> SkipKind.PREVIOUS
+        Player.COMMAND_SEEK_TO_MEDIA_ITEM, Player.COMMAND_SEEK_TO_DEFAULT_POSITION -> SkipKind.JUMP
+        else -> null
+    }
+
+    /**
+     * 1.8.8 (plan-mix §2.3a item 1): Prism's own Next, Previous and queue taps ([PlayerConnection]), which drive the player
+     * directly, go through the same skip path as the session player's. [index] for a place given (a queue tap, the song
+     * before); otherwise worked out as the player's own Next and Previous would. True when it was taken over.
+     */
+    internal fun skipBlend(kind: SkipKind, index: Int = C.INDEX_UNSET): Boolean {
+        if (!::skipFade.isInitialized) return false
+        val target = if (index != C.INDEX_UNSET || kind == SkipKind.JUMP) index else when (kind) {
+            SkipKind.NEXT -> player.nextMediaItemIndex
+            // As seekToPrevious: the song before only near this one's start, else this one again (which isn't blended).
+            SkipKind.PREVIOUS -> if (player.hasPreviousMediaItem() && player.currentPosition <= player.maxSeekToPreviousPosition) player.previousMediaItemIndex else player.currentMediaItemIndex
+            SkipKind.JUMP -> index
+        }
+        return skipFade.press(kind, target)
+    }
+
+    /** A new queue replaces what plays ([action]): with "Blend when I skip" on, the song fades out over 200 ms first. */
+    internal fun newQueueFade(action: () -> Unit) {
+        if (::skipFade.isInitialized) skipFade.fadeOutThen(action) else action()
+    }
     /** The equalizer in use now (as set, or the output's own preset). */
     private var eqNow = com.prism.music.data.prefs.EqSettings()
 
@@ -497,6 +562,19 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
      * keeps everyone on the same song).
      */
     private fun mayBlend(from: MediaItem, to: MediaItem): Boolean {
+        if (!maySkipBlend(from, to)) return false
+        val a = from.toSong() ?: return false
+        val b = to.toSong() ?: return false
+        // Only while an album plays through (a radio or playlist that puts two of an album's songs side by side blends).
+        // An album played as a DJ set is a set: it blends.
+        return blendsAcrossAlbum(a.album?.id, b.album?.id, c.queue.source.value.kind == QueueKind.ALBUM, c.settings.current.mix.keepAlbums, c.dj.onNow)
+    }
+
+    /**
+     * [mayBlend] without the album rule, for "Blend when I skip" (plan-mix §2.1: a skip inside an album isn't gapless
+     * listening): not live streams or music videos, not podcasts, not while singing along, casting or playing with others.
+     */
+    private fun maySkipBlend(from: MediaItem, to: MediaItem): Boolean {
         val a = from.toSong() ?: return false
         val b = to.toSong() ?: return false
         if (a.isLive || b.isLive || from.videoModeId != null || to.videoModeId != null) return false
@@ -506,9 +584,7 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
         if (c.sing.onNow) return false
         if (c.cast.casting) return false
         if (togetherNow()) return false
-        // Only while an album plays through (a radio or playlist that puts two of an album's songs side by side blends).
-        // An album played as a DJ set is a set: it blends.
-        return blendsAcrossAlbum(a.album?.id, b.album?.id, c.queue.source.value.kind == QueueKind.ALBUM, c.settings.current.mix.keepAlbums, c.dj.onNow)
+        return true
     }
 
     /**
@@ -516,10 +592,20 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
      * effects (spatial audio, the ending song's normalization, and the equalizer through the shared audio
      * session), on the same output, and no audio focus of its own.
      */
-    private fun buildTailPlayer(shift: ShiftProcessor): ExoPlayer {
+    private fun buildTailPlayer(shift: ShiftProcessor): ExoPlayer = buildTailPlayer(shift, normalizeGainDb)
+
+    /**
+     * 1.8.8 Mix it yourself: one of the transition editor's two small players ([MixPreview]) for [item]: the queue's
+     * second player's sources and sound at the song's own normalization, with [fx] (Automix's effects) after the shift.
+     */
+    internal fun buildPreviewPlayer(item: MediaItem, fx: TransitionFx): ExoPlayer =
+        buildTailPlayer(ShiftProcessor(), startingGain(item, player.currentTimeline) ?: normalizeGainDb, fx)
+
+    /** [buildTailPlayer] at [gainDb]: a skip-blend's head plays the chosen song at its own normalization (1.8.8). */
+    private fun buildTailPlayer(shift: ShiftProcessor, gainDb: Float, fx: TransitionFx? = null): ExoPlayer {
         val s = c.settings.current
         val tailSpatial = SpatialAudioProcessor().apply { configure(s.spatial, s.spatialAmount) }
-        val tailNormalizer = NormalizerProcessor().apply { setGainDb(normalizeGainDb) }
+        val tailNormalizer = NormalizerProcessor().apply { setGainDb(gainDb) }
         // The same headphone correction as the main player, so a blend doesn't change the sound.
         val tailEq = ParametricEqProcessor().apply { c.headphoneEq.active.value.let { configure(it?.profile, it?.strength ?: 1f) } }
         // Audio renderers only: it plays a song's ending and nothing else (plan 5.1).
@@ -528,7 +614,7 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
                 DefaultAudioSink.Builder(context)
                     .setEnableFloatOutput(enableFloatOutput || s.lossless)
                     .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-                    .setAudioProcessors(arrayOf(shift, tailEq, tailSpatial, tailNormalizer))
+                    .setAudioProcessors(listOfNotNull(shift, fx, tailEq, tailSpatial, tailNormalizer).toTypedArray())
                     .build()
 
             override fun buildAudioRenderers(
@@ -639,6 +725,7 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
         PlaybackServices.failForTest = null
         PlaybackServices.taskRemovedForTest = null
         if (PlaybackServices.playerForTest === player) PlaybackServices.playerForTest = null
+        if (::skipFade.isInitialized && PlaybackServices.skipFadeForTest === skipFade) PlaybackServices.skipFadeForTest = null
         flushPlayTime()
         saveEpisodePosition()
         saveQueue(now = true)
@@ -877,7 +964,8 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
         return true
     }
 
-    private fun mixing() = ::mix.isInitialized && mix.blending
+    /** A blend owns the volume and speed now: an end-of-song one, or a skip-blend (1.8.8: so the listener's speed isn't reset). */
+    private fun mixing() = (::mix.isInitialized && mix.blending) || (::skipFade.isInitialized && skipFade.active)
 
     override fun onPlaybackParametersChanged(playbackParameters: androidx.media3.common.PlaybackParameters) {
         if (playbackParameters.speed == 1f) restoreMusicSpeed()
@@ -1072,6 +1160,8 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
      */
     override fun onPositionDiscontinuity(oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) {
         if (reason == Player.DISCONTINUITY_REASON_SEEK && player.playbackState == Player.STATE_IDLE && player.playerError != null) player.prepare()
+        // 1.8.8: a seek by the listener during a skip-blend finishes it at once on the new song.
+        if (::skipFade.isInitialized) skipFade.discontinuity(reason)
     }
 
     override fun onPlayerError(error: PlaybackException) {
@@ -1640,6 +1730,8 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
                 player.addMediaItems(answer.add.map { it.toMediaItem() })
                 fb.served(answer.add.map { it.id })
                 if (answer.cameRound) c.player.reportError(tr(R.string.no_repeats_ran_out))
+                // A Radio button's notice (1.8.8): the radio has really started.
+                else if (c.player.radioNotice.take(src, answer.add.size)) c.player.reportError(tr(R.string.radio_started))
             }
         }
         autoplayJob = job
@@ -1936,6 +2028,8 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
     private val prefetched = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
     /** Videos that failed to play; their streams are re-resolved on the next try. */
     private val failedVideos = HashSet<String>()
+    /** Videos given one more go after failing past their song's end ([videoTakeOver]): once each this session. */
+    private val outroRetried = HashSet<String>()
 
     /** Swaps the current item between its audio track and its music video. Returns an error message, if any. */
     suspend fun setVideoMode(enabled: Boolean): String? {
@@ -2117,10 +2211,25 @@ open class PlaybackService : MediaLibraryService(), Player.Listener {
             c.player.reportError(tr(R.string.the_live_video_didn_t_load))
             return
         }
+        val lag = current.videoModeId?.takeIf { it != song.id }?.let { c.videoSync.cached(song.id, it) } ?: 0L
+        val videoPos = player.currentPosition
+        // Ko-fi (Android TV): a video that failed past its song's end (its outro) went back to a song that was already
+        // over, and so on to the next song before the video had ended. It gets one more go where it was (once).
+        val vid = current.videoModeId
+        val failed = player.playerError != null
+        val takeOver = videoTakeOver(videoPos, lag, song.durationSec * 1000L, triedAgain = !failed || vid == null || vid in outroRetried)
+        if (takeOver == VideoTakeOver.VideoAgain && vid != null) {
+            outroRetried += vid
+            AudioDiagnostics.log("video", "video $vid for $songId failed at $videoPos ms, past its song's end (${song.durationSec} s): one more go, not on to the next song")
+            c.streams.invalidate(vid)
+            player.prepare()
+            player.seekTo(idx, videoPos)
+            player.play()
+            return
+        }
         current.videoModeId?.let { failedVideos += it; prefetched -= it }
         android.util.Log.w("PrismVideo", "video ${current.videoModeId} for $songId didn't load (${player.playerError?.errorCodeName ?: "no picture in time"}); back to the song")
-        val lag = current.videoModeId?.takeIf { it != song.id }?.let { c.videoSync.cached(song.id, it) } ?: 0L
-        val pos = (player.currentPosition - lag).coerceAtLeast(0)
+        val pos = (takeOver as? VideoTakeOver.Song)?.atMs ?: (videoPos - lag).coerceAtLeast(0)
         swapInPlace(idx, song.toMediaItem(null))
         player.seekTo(idx, pos)
         player.prepare()
