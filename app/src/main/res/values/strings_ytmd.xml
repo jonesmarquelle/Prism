@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  YouTube Music Desktop output (this fork's own feature). Kept out of strings.xml so merges from upstream Prism don't
+  conflict, and English only: the other languages fall back to these.
+-->
+<resources xmlns:tools="http://schemas.android.com/tools" tools:ignore="MissingTranslation">
+    <string name="ytmd_group">YouTube Music Desktop</string>
+    <string name="ytmd_detail">YouTube Music Desktop</string>
+    <string name="ytmd_play_there">Play it on this PC</string>
+    <string name="ytmd_pair_first">Pairs the first time</string>
+    <string name="ytmd_approve_code">On the PC, allow code %1$s</string>
+    <string name="ytmd_approve_body">YouTube Music Desktop is asking whether to allow Prism. Allow it on the PC; it shows this code too:</string>
+    <string name="ytmd_approve_toast">Allow Prism in YouTube Music Desktop: code %1$s</string>
+    <string name="ytmd_not_allowed">%1$s didn\'t allow Prism. Turn on Companion authorization in YTMD\'s Integrations settings and try again.</string>
+    <string name="ytmd_cant_reach">Couldn\'t reach %1$s. In YTMD, turn on the Companion server and allow connections from the network.</string>
+    <string name="ytmd_add_by_address">Add a PC by its address</string>
+    <string name="ytmd_add_by_address_detail">When it isn\'t found on this Wi-Fi</string>
+    <string name="ytmd_address_hint">192.168.1.20</string>
+    <string name="ytmd_address_title">YouTube Music Desktop\'s address</string>
+    <string name="ytmd_address_body">The PC\'s IP address on your network (and its port if it isn\'t 9863).</string>
+    <string name="ytmd_address_bad">That isn\'t an IP address</string>
+    <string name="ytmd_add">Add</string>
+    <string name="ytmd_forget">Forget</string>
+    <string name="ytmd_plays_here">%1$s plays on this phone: YouTube Music Desktop can\'t play it</string>
+</resources>

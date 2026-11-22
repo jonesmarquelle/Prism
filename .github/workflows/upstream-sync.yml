@@ -1,0 +1,71 @@
+# Fork only: keeps this fork up to date with upstream Prism (Yigder/Prism).
+#
+# Every day (or when run by hand) upstream's main is merged into this fork's main on the `upstream-sync` branch, and a
+# pull request is opened for it. When the merge is clean the PR is ready to merge; when it isn't, the branch carries
+# upstream's main as it is and the PR shows the conflicts to resolve. The fork's own code lives in its own files
+# (com.prism.music.ytmd, ui/player/YtmdOutputs.kt, res/values/strings_ytmd.xml), so conflicts stay small.
+name: Sync with upstream Prism
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM: https://github.com/Yigder/Prism.git
+      BRANCH: upstream-sync
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          git checkout -B "$BRANCH"
+          if git merge --no-edit upstream/main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            git checkout -B "$BRANCH" upstream/main
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+          git push --force origin "$BRANCH"
+
+      - name: Open a pull request
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          if [ "${{ steps.merge.outputs.conflict }}" = "true" ]; then
+            body="Upstream Prism's main doesn't merge cleanly into this fork. This branch is upstream's main as it is: resolve the conflicts in this PR (most likely in Cast.kt, PlayerControls.kt or build.gradle.kts, where the YTMD output hooks in)."
+          else
+            body="Upstream Prism's latest main, merged cleanly into this fork's main. Build it once and try YouTube Music Desktop output before merging."
+          fi
+          existing=$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh pr comment "$existing" --body "Updated with upstream $(git rev-parse --short upstream/main). $body"
+          else
+            gh pr create --head "$BRANCH" --base main --title "Sync with upstream Prism" --body "$body"
+          fi

@@ -131,6 +131,7 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
         val lock = runCatching { wifi?.createMulticastLock("prism-connect")?.apply { setReferenceCounted(false); acquire() } }.getOrNull()
         val notify = scope.launch(Dispatchers.IO) { listenForNotify() }
         val google = withContext(Dispatchers.Main) { startCastDiscovery() }
+        val ytmdLook = withContext(Dispatchers.Main) { startYtmdDiscovery() }
         try {
             manual.forEach { describe(it, force = true) }
             while (kotlinx.coroutines.currentCoroutineContext().isActive) {
@@ -144,6 +145,7 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
         } finally {
             notify.cancel()
             google?.let { l -> runCatching { nsd?.stopServiceDiscovery(l) } }
+            ytmdDesktops.stopDiscovery(ytmdLook)
             castListed.clear()
             runCatching { lock?.release() }
         }
@@ -282,6 +284,7 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
         hooks = h
         p.addListener(this)
         if (tv != null) { h.beforeCasting(); applyLocalMode() }
+        ytmd?.let { y -> h.beforeCasting(); applyLocalMode(); y.sendCurrent(p.currentPosition) }
         session?.let { s ->
             h.beforeCasting()
             applyLocalMode()
@@ -291,7 +294,7 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
 
     fun detach(p: ExoPlayer) {
         if (player !== p) return
-        if (session != null || tv != null) disconnect(tr(R.string.casting_stopped), keepPlaying = false)
+        if (session != null || tv != null || ytmd != null) disconnect(tr(R.string.casting_stopped), keepPlaying = false)
         p.removeListener(this)
         player = null
         hooks = null
@@ -390,9 +393,10 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
     /** Sends what's playing to [r] from now on. */
     fun connect(r: Renderer) {
         if (r.kind == RendererKind.PRISM_TV) return
+        if (r.kind == RendererKind.YTMD) { connectYtmd(r); return }
         val now = state.value
         if (now is CastState.Casting && now.renderer.id == r.id) return
-        if (session != null || tv != null) disconnect(null, keepPlaying = true)
+        if (session != null || tv != null || ytmd != null) disconnect(null, keepPlaying = true)
         _state.value = CastState.Connecting(r)
         scope.launch {
             val ctl: RendererLink = if (r.kind == RendererKind.GOOGLE_CAST) GoogleCastLink(r) else RendererControl(c.http, r)
@@ -461,7 +465,7 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
             is CastState.Connecting -> if (now.renderer.id == r.id) return
             CastState.Idle -> Unit
         }
-        if (session != null || tv != null) disconnect(null, keepPlaying = true)
+        if (session != null || tv != null || ytmd != null) disconnect(null, keepPlaying = true)
         val p = player
         if (p == null || p.mediaItemCount == 0) { _events.tryEmit(tr(R.string.nothing_s_playing_here)); return }
         val first = TvCast.build(p, 1, p.currentPosition, c.queue.source.value.title)
@@ -531,6 +535,15 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
      */
     fun disconnect(message: String? = null, keepPlaying: Boolean = false) {
         tv?.let { t -> endTv(t, message, keepPlaying || message == null); return }
+        ytmd?.let { y -> endYtmd(y, message, keepPlaying); return }
+        // Still pairing with / reaching a YTMD: it's let go.
+        if ((state.value as? CastState.Connecting)?.renderer?.kind == RendererKind.YTMD) {
+            ytmdConnecting?.cancel()
+            ytmdConnecting = null
+            _ytmdCode.value = null
+            _state.value = CastState.Idle
+            return
+        }
         // Still connecting to a Prism TV: its pairing code isn't asked for any more, and the connection's let go.
         if ((state.value as? CastState.Connecting)?.renderer?.kind == RendererKind.PRISM_TV) {
             tvConnecting?.cancel()
@@ -569,9 +582,16 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
     }
 
     /** The renderer's volume (0–100), for the player's volume bar and the phone's volume keys. */
-    val volume: Int? get() = tv?.volume ?: session?.volume
+    val volume: Int? get() = tv?.volume ?: ytmd?.volume ?: session?.volume
 
     fun setVolume(v: Int) {
+        ytmd?.let { y ->
+            if (y.volume == v.coerceIn(0, 100)) return
+            y.setVolume(v)
+            _state.value = CastState.Casting(y.renderer, y.volume)
+            hooks?.remoteChanged()
+            return
+        }
         tv?.let { t ->
             if (t.volume == v.coerceIn(0, 100)) return
             t.setVolume(v)
@@ -603,7 +623,7 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
     private fun applyLocalMode() {
         val p = player ?: return
         // A song a Prism TV can't play (a file on the phone) plays here meanwhile.
-        val remote = (session != null && !liveLocal) || tv?.local == false
+        val remote = (session != null && !liveLocal) || tv?.local == false || ytmd?.local == false
         if (remote) {
             if (p.volume != 0f) p.volume = 0f
             muted = true
@@ -964,10 +984,131 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
         return (cur.durationMs - at).coerceIn(0, 30_000)
     }
 
+    // ------------------------------------------------------------ YouTube Music Desktop (this fork)
+
+    /** YTMD apps on the network, and their tokens ([com.prism.music.ytmd]). */
+    val ytmdDesktops = com.prism.music.ytmd.YtmdDesktops(app)
+
+    /** YTMD playing along ([com.prism.music.ytmd.YtmdCast]), instead of a [session]. */
+    private var ytmd: com.prism.music.ytmd.YtmdCast? = null
+    private var ytmdConnecting: Job? = null
+    private val _ytmdCode = MutableStateFlow<String?>(null)
+    /** The pairing code to allow on the PC, while it's being asked for. */
+    val ytmdCode: StateFlow<String?> = _ytmdCode.asStateFlow()
+
+    private fun startYtmdDiscovery(): android.net.nsd.NsdManager.DiscoveryListener? {
+        if (!ytmdDesktops.enabled) return null
+        ytmdDesktops.manual().forEach { r -> found[r.id] = r to SystemClock.elapsedRealtime(); castListed["ytmd/" + r.id] = r.id }
+        publishFound()
+        return ytmdDesktops.startDiscovery(scope, resolveLock,
+            found = { r -> castListed["ytmd/" + r.id] = r.id; found[r.id] = r to SystemClock.elapsedRealtime(); publishFound() },
+            lost = { id ->
+                castListed.remove("ytmd/$id")
+                if (id != (state.value as? CastState.Casting)?.renderer?.id && found.remove(id) != null) publishFound()
+            },
+        )
+    }
+
+    /** A YTMD added by its address: listed from now on (null when [address] isn't an IP address). */
+    fun addYtmd(address: String): Renderer? {
+        val r = ytmdDesktops.addManual(address) ?: return null
+        found[r.id] = r to SystemClock.elapsedRealtime()
+        castListed["ytmd/" + r.id] = r.id
+        publishFound()
+        return r
+    }
+
+    fun forgetYtmd(r: Renderer) {
+        if ((state.value as? CastState.Casting)?.renderer?.id == r.id) disconnect(null, keepPlaying = true)
+        ytmdDesktops.removeManual(r)
+        castListed.remove("ytmd/" + r.id)
+        if (found.remove(r.id) != null) publishFound()
+    }
+
+    /**
+     * What's playing goes to YouTube Music Desktop on a PC: pairs first if there's no token for it (a code shown here
+     * and on the PC, allowed there), then plays along as a Prism TV does.
+     */
+    private fun connectYtmd(r: Renderer) {
+        when (val now = state.value) {
+            is CastState.Casting -> if (now.renderer.id == r.id) return
+            is CastState.Connecting -> if (now.renderer.id == r.id) return
+            CastState.Idle -> Unit
+        }
+        if (session != null || tv != null || ytmd != null) disconnect(null, keepPlaying = true)
+        _state.value = CastState.Connecting(r)
+        val host = com.prism.music.ytmd.YtmdDesktops.hostOf(r)
+        val api = com.prism.music.ytmd.YtmdApi(c.http, host, com.prism.music.ytmd.YtmdDesktops.portOf(r))
+        ytmdConnecting = scope.launch {
+            val why = runCatching {
+                api.metadata()
+                api.token = ytmdDesktops.token(r)
+                // A token it no longer takes (Prism was removed from its list) is asked for again.
+                if (api.token != null && runCatching { api.state() }.exceptionOrNull().let { it is com.prism.music.ytmd.YtmdException && (it.code == 401 || it.code == 403) }) {
+                    ytmdDesktops.forgetToken(r); api.token = null
+                }
+                if (api.token == null) {
+                    val code = api.requestCode()
+                    _ytmdCode.value = code
+                    _events.tryEmit(tr(R.string.ytmd_approve_toast, code))
+                    try { ytmdDesktops.saveToken(r, api.requestToken(code)) } finally { _ytmdCode.value = null }
+                }
+                api.state()
+            }.fold({ null }, { e ->
+                Log.w(TAG, "couldn't connect to ${r.name}", e)
+                if (e is CancellationException) throw e
+                if (e is com.prism.music.ytmd.YtmdException && (e.code == 401 || e.code == 403)) tr(R.string.ytmd_not_allowed, r.name) else tr(R.string.ytmd_cant_reach, r.name)
+            })
+            if (state.value != CastState.Connecting(r)) return@launch
+            if (why != null) { _state.value = CastState.Idle; _events.tryEmit(why); return@launch }
+            val y = com.prism.music.ytmd.YtmdCast(c, r, api, scope, { player },
+                lost = { msg -> if (ytmd != null) disconnect(msg, keepPlaying = false) },
+                changed = { onYtmdChanged() })
+            ytmd = y
+            casting = true
+            liveLocal = false
+            hooks?.beforeCasting()
+            applyLocalMode()
+            hooks?.remoteChanged()
+            _state.value = CastState.Casting(r, y.volume)
+            y.start()
+            val p = player
+            if (p == null) c.player.connect() else y.sendCurrent(p.currentPosition)
+            Log.i(TAG, "playing on ${r.name} (YouTube Music Desktop at $host)")
+        }
+    }
+
+    private fun onYtmdChanged() {
+        val y = ytmd ?: return
+        applyLocalMode()
+        _state.value = CastState.Casting(y.renderer, y.volume)
+        hooks?.remoteChanged()
+    }
+
+    /** YTMD stops playing along: it pauses, and the music carries on here ([keepPlaying]) where it was, or pauses. */
+    private fun endYtmd(y: com.prism.music.ytmd.YtmdCast, message: String?, keepPlaying: Boolean) {
+        val place = y.pcPlace()
+        ytmd = null
+        casting = false
+        y.end()
+        val p = player
+        if (p != null) {
+            if (place != null && abs(p.currentPosition - place) > 300) p.seekTo(place)
+            if (!keepPlaying && p.playWhenReady) p.pause()
+        }
+        applyLocalMode()
+        hooks?.afterCasting()
+        hooks?.remoteChanged()
+        _state.value = CastState.Idle
+        if (message != null) _events.tryEmit(message)
+        Log.i(TAG, "stopped playing on ${y.renderer.name}${message?.let { ": $it" } ?: ""}")
+    }
+
     // ------------------------------------------------------------ The phone's player changing
 
     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
         tv?.let { it.onMediaItemTransition(reason); return }
+        ytmd?.let { it.onMediaItemTransition(reason); return }
         val s = session ?: return
         val p = player ?: return
         val song = mediaItem?.toSong() ?: return
@@ -995,6 +1136,7 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
 
     override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
         tv?.let { it.onPlayWhenReadyChanged(); return }
+        ytmd?.let { it.onPlayWhenReadyChanged(playWhenReady); return }
         val s = session ?: return
         val p = player ?: return
         if (liveLocal || playWhenReady == s.wantPlaying) return
@@ -1021,6 +1163,10 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
     }
 
     override fun onPositionDiscontinuity(oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) {
+        ytmd?.let { y ->
+            if (reason == Player.DISCONTINUITY_REASON_SEEK) y.onSeek(oldPosition.mediaItemIndex == newPosition.mediaItemIndex, newPosition.positionMs)
+            return
+        }
         tv?.let { t ->
             if (reason == Player.DISCONTINUITY_REASON_SEEK) t.onSeek(oldPosition.mediaItemIndex == newPosition.mediaItemIndex, newPosition.positionMs)
             return
@@ -1039,17 +1185,20 @@ class Cast(private val app: Application, private val c: AppContainer) : Player.L
     }
 
     override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+        if (ytmd != null) return
         tv?.let { it.onQueueChanged(); return }
         val s = session ?: return
         if (s.current?.started == true && s.waiting == null) armNext(s)
     }
 
     override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
+        if (ytmd != null) return
         tv?.let { it.onQueueChanged(); return }
         session?.let { if (it.current?.started == true) armNext(it) }
     }
 
     override fun onRepeatModeChanged(repeatMode: Int) {
+        if (ytmd != null) return
         tv?.let { it.onQueueChanged(); return }
         session?.let { if (it.current?.started == true) armNext(it) }
     }

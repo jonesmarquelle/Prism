@@ -1385,6 +1385,7 @@ fun OutputPickerSheet(phoneName: String, onDismiss: () -> Unit) {
             // Prism devices first: a TV with Prism on it plays there in the app, rather than in its own Cast player.
             PrismDevices()
             SpeakersAndTvs(castState, castingTo)
+            YtmdOutputs(castState, castingTo)
         }
     }
 }
@@ -1504,7 +1505,8 @@ private fun SpeakersAndTvs(castState: com.prism.music.connect.CastState, casting
     val shown = renderers.let { list ->
         // The one being cast to stays listed even if it's stopped answering searches.
         val playing = (castState as? com.prism.music.connect.CastState.Casting)?.renderer ?: (castState as? com.prism.music.connect.CastState.Connecting)?.renderer
-        val all = if (playing != null && playing.kind != com.prism.music.connect.RendererKind.PRISM_TV && list.none { it.id == playing.id }) listOf(playing) + list else list
+        val all = (if (playing != null && playing.kind != com.prism.music.connect.RendererKind.PRISM_TV && list.none { it.id == playing.id }) listOf(playing) + list else list)
+            .filter { it.kind != com.prism.music.connect.RendererKind.YTMD } // Their own group (YtmdOutputs).
         // A TV whose Prism is listed under Prism devices isn't listed again as its own Cast or DLNA player.
         all.filter { r -> r.id == castingTo || prismTvs.none { it.tv && rendererHost(r) in it.hosts } }
     }
