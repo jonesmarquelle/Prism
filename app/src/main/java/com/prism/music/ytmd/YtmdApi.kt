@@ -2,6 +2,9 @@ package com.prism.music.ytmd
 
 import com.prism.music.connect.LanHttp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -101,15 +104,41 @@ class YtmdApi(http: OkHttpClient, val host: String, val port: Int = DEFAULT_PORT
 
     private val base get() = "http://${if (host.contains(':')) "[$host]" else host}:$port"
 
-    private suspend fun call(path: String, body: JsonObject? = null, slow: Boolean = false, auth: Boolean = true): String = withContext(Dispatchers.IO) {
+    /**
+     * YTMD's rate limits, per token (companion-server/api/v1): `/state` once every 5 s, `/command` twice a second, 100
+     * requests a minute in all. Prism keeps to them, rather than have a refused (429) command go unheard.
+     */
+    private val paces = mapOf("/api/v1/state" to Pace(STATE_EVERY_MS), "/api/v1/command" to Pace(COMMAND_EVERY_MS))
+
+    private class Pace(val everyMs: Long) {
+        val lock = Mutex()
+        var lastAt = 0L
+    }
+
+    private suspend fun call(path: String, body: JsonObject? = null, slow: Boolean = false, auth: Boolean = true): String {
+        val pace = paces[path] ?: return send(path, body, slow, auth)
+        return pace.lock.withLock {
+            val wait = pace.lastAt + pace.everyMs - System.currentTimeMillis()
+            if (wait > 0) delay(wait)
+            try { send(path, body, slow, auth) } finally { pace.lastAt = System.currentTimeMillis() }
+        }
+    }
+
+    /** One request; refused for going too fast (429), it's sent again once, when YTMD says it may be. */
+    private suspend fun send(path: String, body: JsonObject?, slow: Boolean, auth: Boolean): String = withContext(Dispatchers.IO) {
         val b = Request.Builder().url(base + path).header("User-Agent", "Prism")
         if (auth) token?.let { b.header("Authorization", it) }
         if (body != null) b.post(body.toString().toRequestBody("application/json".toMediaType()))
-        (if (slow) slowClient else client).newCall(b.build()).execute().use { r ->
-            val text = r.body?.string().orEmpty()
-            if (!r.isSuccessful) throw YtmdException("YTMD ${r.code} on $path${message(text)?.let { ": $it" } ?: ""}", r.code)
-            text
+        val c = if (slow) slowClient else client
+        var (code, text, retryMs) = c.newCall(b.build()).execute().use { r ->
+            Triple(r.code, r.body?.string().orEmpty(), retryAfterMs(r.header("x-ratelimit-reset"), r.header("retry-after")))
         }
+        if (code == 429) {
+            delay(retryMs)
+            c.newCall(b.build()).execute().use { r -> code = r.code; text = r.body?.string().orEmpty() }
+        }
+        if (code !in 200..299) throw YtmdException("YTMD $code on $path${message(text)?.let { ": $it" } ?: ""}", code)
+        text
     }
 
     private fun message(text: String): String? =
@@ -154,6 +183,9 @@ class YtmdApi(http: OkHttpClient, val host: String, val port: Int = DEFAULT_PORT
     suspend fun setVolume(v: Int) = command("setVolume", JsonPrimitive(v.coerceIn(0, 100)))
     suspend fun changeVideo(videoId: String) = command("changeVideo", buildJsonObject { put("videoId", videoId); put("playlistId", JsonNull) })
 
+    private fun retryAfterMs(reset: String?, retryAfter: String?): Long =
+        ((reset ?: retryAfter)?.trim()?.toDoubleOrNull()?.let { (it * 1000).toLong() + 100 } ?: 1_000L).coerceIn(100, 10_000)
+
     private fun field(text: String, name: String): String? =
         runCatching { (Json.parseToJsonElement(text).jsonObject[name] as? JsonPrimitive)?.content }.getOrNull()?.takeIf { it.isNotBlank() }
 
@@ -163,5 +195,8 @@ class YtmdApi(http: OkHttpClient, val host: String, val port: Int = DEFAULT_PORT
         const val APP_ID = "prismmusic"
         const val APP_NAME = "Prism"
         const val APP_VERSION = "1.0.0"
+        /** YTMD's own limits, with a little to spare: `/state` 1 per 5 s, `/command` 2 per second. */
+        const val STATE_EVERY_MS = 5_200L
+        const val COMMAND_EVERY_MS = 550L
     }
 }

@@ -60,6 +60,49 @@ class YtmdTest {
         assertFalse(YtmdDesktops.isManual(r))
     }
 
+    /** A Windows PC with Tailscale and idle adapters lists all of them over mDNS: the LAN one goes first. */
+    @Test fun ranksAPcsAddressesForThePhone() {
+        val pc = listOf("169.254.11.227", "169.254.45.200", "100.66.25.114", "169.254.74.81", "192.168.0.26", "169.254.63.196", "127.0.0.1")
+        val ranked = YtmdDesktops.rankHosts(pc, listOf("192.168.0.57" to 24))
+        assertEquals("192.168.0.26", ranked.first())
+        assertEquals("100.66.25.114", ranked[1])
+        assertEquals("127.0.0.1", ranked.last())
+        // The phone's own network wins over another private one; without knowing it, 192.168 still beats 10/8.
+        assertEquals(listOf("10.0.0.5", "192.168.1.9"), YtmdDesktops.rankHosts(listOf("192.168.1.9", "10.0.0.5"), listOf("10.0.0.40" to 24)))
+        assertEquals(listOf("192.168.1.9", "10.0.0.5"), YtmdDesktops.rankHosts(listOf("10.0.0.5", "192.168.1.9"), emptyList()))
+        assertEquals(emptyList<String>(), YtmdDesktops.rankHosts(listOf("not an ip"), emptyList()))
+    }
+
+    /** YTMD's answer to Android's lookup: a PTR, then (in additionals) its SRV, TXT and an A record per address. */
+    @Test fun readsAllAddressesFromAnMdnsAnswer() {
+        val out = ByteArrayOutputStream()
+        fun u16(v: Int) { out.write(v ushr 8); out.write(v and 0xFF) }
+        fun name(n: String) { n.split('.').forEach { out.write(it.length); out.write(it.toByteArray()) }; out.write(0) }
+        u16(0); u16(0x8400); u16(0); u16(1); u16(0); u16(4)
+        name("_ytmdesktop._tcp.local"); u16(12); u16(1); u16(0); u16(60)
+        val inst = "DESKTOP-AADMRAK._ytmdesktop._tcp.local".toByteArray().size + 2
+        u16(inst); name("DESKTOP-AADMRAK._ytmdesktop._tcp.local")
+        // SRV, name compressed (pointer to the instance name just written, at the PTR's data).
+        val instAt = 12 + "_ytmdesktop._tcp.local".length + 2 + 10
+        u16(0xC000 or instAt); u16(33); u16(1); u16(0); u16(60)
+        val target = ByteArrayOutputStream().apply { "DESKTOP-AADMRAK.local".split('.').forEach { write(it.length); write(it.toByteArray()) }; write(0) }.toByteArray()
+        u16(6 + target.size); u16(0); u16(0); u16(9863); out.write(target)
+        val targetAt = out.size() - target.size
+        for (ip in listOf("169.254.11.227", "100.66.25.114", "192.168.0.26")) {
+            u16(0xC000 or targetAt); u16(1); u16(1); u16(0); u16(60); u16(4)
+            ip.split('.').forEach { out.write(it.toInt()) }
+        }
+        val packet = out.toByteArray()
+        assertEquals(listOf("169.254.11.227", "100.66.25.114", "192.168.0.26"), MdnsAddresses.addressesFor(packet, "DESKTOP-AADMRAK.local"))
+        // Cut short mid-record: the addresses before it still count.
+        assertEquals(listOf("169.254.11.227", "100.66.25.114"), MdnsAddresses.addressesFor(packet.copyOf(packet.size - 3), "DESKTOP-AADMRAK.local"))
+        assertEquals(emptyList<String>(), MdnsAddresses.addressesFor(packet, "OTHER-PC.local"))
+        // A query (not a response) is nobody's answer.
+        assertEquals(emptyList<String>(), MdnsAddresses.addressesFor(MdnsAddresses.query("DESKTOP-AADMRAK.local"), "DESKTOP-AADMRAK.local"))
+        assertTrue(YtmdDesktops.isOnNetworks("192.168.0.26", listOf("192.168.0.235" to 24)))
+        assertFalse(YtmdDesktops.isOnNetworks("100.66.25.114", listOf("192.168.0.235" to 24)))
+    }
+
     @Test fun pairsAndSendsCommands() = FakeYtmd(stateJson).use { pc ->
         val api = YtmdApi(OkHttpClient(), "127.0.0.1", pc.port)
         runBlocking {

@@ -96,11 +96,15 @@ class YtmdCast(
         return s.progressMs + if (s.playing) SystemClock.elapsedRealtime() - lastAt else 0
     }
 
+    private var volumeJob: Job? = null
+
+    /** While it's dragged, only where it ends up goes (YTMD takes two commands a second). */
     fun setVolume(level: Int) {
         val v = level.coerceIn(0, 100)
         volume = v
         volumeSetAt = SystemClock.elapsedRealtime()
-        send("volume") { api.setVolume(v) }
+        volumeJob?.cancel()
+        volumeJob = scope.launch { delay(VOLUME_SETTLE_MS); send("volume") { api.setVolume(v) } }
     }
 
     // ------------------------------------------------------------ What the PC says
@@ -127,7 +131,7 @@ class YtmdCast(
                     if (failingSince == 0L) failingSince = SystemClock.elapsedRealtime()
                     if (SystemClock.elapsedRealtime() - failingSince > GIVE_UP_MS) { scope.launch { lost(tr(R.string.lost_the_connection_to, renderer.name)) }; return }
                 }
-                delay(if ((r.exceptionOrNull() as? YtmdException)?.code == 429) 5_000 else POLL_MS)
+                delay(POLL_MS)
             }
         }
     }
@@ -266,7 +270,9 @@ class YtmdCast(
 
     companion object {
         private const val TAG = "PrismYtmd"
-        private const val POLL_MS = 1_500L
+        /** YTMD allows /state once every 5 s ([YtmdApi.STATE_EVERY_MS] keeps to it): this is while the feed's down. */
+        private const val POLL_MS = 5_500L
+        private const val VOLUME_SETTLE_MS = 250L
         private const val POLL_SPELL_MS = 20_000L
         private const val GIVE_UP_MS = 15_000L
         /** After a song's sent, this long for the PC to load it before what it says counts. */
