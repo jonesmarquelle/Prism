@@ -383,7 +383,8 @@ class UpdateChecker(private val context: Context, private val http: OkHttpClient
     enum class InstallStep { START, WAIT, REOPEN }
 
     companion object {
-        const val REPO = "Yigder/Prism"
+        /** Fork: this fork's releases ([BuildConfig.UPDATE_REPO]), each upstream release with the fork merged in. */
+        const val REPO = BuildConfig.UPDATE_REPO
 
         /** How long between background checks (#278: was six hours). */
         const val CHECK_EVERY_MS = 3_600_000L

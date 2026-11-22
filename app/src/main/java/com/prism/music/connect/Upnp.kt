@@ -15,7 +15,7 @@ data class UpnpService(val type: String, val controlUrl: String, val eventUrl: S
  * How a device is spoken to: UPnP / DLNA, Google Cast (Chromecast, Google TV, speakers with Cast built in), or a TV
  * with Prism on it (1.8.0: it plays along with the phone over the handoff link, [TvCast]).
  */
-enum class RendererKind { UPNP, GOOGLE_CAST, PRISM_TV }
+enum class RendererKind { UPNP, GOOGLE_CAST, PRISM_TV, YTMD }
 
 /**
  * A speaker, TV or receiver on the local network that plays what it's sent. For UPnP / DLNA [id] is its UDN (stable
@@ -41,6 +41,7 @@ data class Renderer(
             return when (kind) {
                 RendererKind.GOOGLE_CAST -> listOf(about, "Google Cast").filter { it.isNotBlank() }.joinToString(" · ")
                 RendererKind.PRISM_TV -> "Prism TV"
+                RendererKind.YTMD -> com.prism.music.tr(com.prism.music.R.string.ytmd_detail)
                 RendererKind.UPNP -> about.ifBlank { "Speaker or TV" }
             }
         }

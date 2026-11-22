@@ -1,0 +1,139 @@
+# Fork only: makes this fork's releases, which Prism's in-app updater offers (BuildConfig.UPDATE_REPO).
+#
+# Every few hours it looks at upstream Prism's latest release (Yigder/Prism). When it's one this fork hasn't merged
+# yet, its tag is merged into main. Then, when main has anything no release of the fork has (upstream's release, or a
+# change of the fork's own), it builds a signed APK and publishes it as "v<upstream version>.<n>" with Prism.apk
+# attached: 1.8.7.6.1, 1.8.7.6.2… and with upstream's 1.8.7.7, 1.8.7.7.1. The updater then offers it like any update.
+#
+# When upstream's release doesn't merge cleanly, nothing is released: a pull request with the conflicts is opened
+# instead (the phone stays on the last fork release meanwhile). Merge it, and the next run releases.
+#
+# Needs these repository secrets (Settings → Secrets and variables → Actions), the same key every time, or Android
+# won't install one release over another:
+#   SIGNING_KEYSTORE_B64   the .jks keystore, base64
+#   SIGNING_STORE_PASSWORD, SIGNING_KEY_ALIAS, SIGNING_KEY_PASSWORD
+name: Fork release
+
+on:
+  schedule:
+    - cron: "41 */6 * * *"
+  push:
+    branches: [main]
+    paths: ["app/**", "baselineprofile/**", "gradle/**", "*.gradle.kts", "gradle.properties"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: Yigder/Prism
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream's latest release
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tag=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)
+          echo "Upstream's latest release: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          git fetch --no-tags upstream "refs/tags/$tag:refs/upstream-tags/$tag"
+          if git merge-base --is-ancestor "refs/upstream-tags/$tag" HEAD; then
+            echo "Already merged."
+          elif git merge --no-edit -m "Merge upstream Prism $tag" "refs/upstream-tags/$tag"; then
+            git push origin HEAD:main
+          else
+            git merge --abort
+            branch="upstream-$tag"
+            git push --force origin "refs/upstream-tags/$tag:refs/heads/$branch"
+            if [ -z "$(gh pr list --head "$branch" --base main --state open --json number --jq '.[0].number')" ]; then
+              gh pr create --head "$branch" --base main --title "Merge upstream Prism $tag" --body "Upstream Prism $tag doesn't merge cleanly into the fork, so it wasn't released. Resolve the conflicts here (most likely where the YouTube Music Desktop output hooks in: Cast.kt, PlayerControls.kt, build.gradle.kts, Updates.kt) and merge: the next run of the Fork release workflow releases it."
+            fi
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Work out the version
+        id: version
+        if: steps.merge.outputs.conflict != 'true'
+        run: |
+          base=$(sed -n 's/^ *versionName = "\(.*\)"/\1/p' app/build.gradle.kts | head -1)
+          last=$(gh release list --exclude-pre-releases --limit 100 --json tagName --jq '.[].tagName' | grep -E "^v${base//./\\.}\.[0-9]+$" | sort -V | tail -1 || true)
+          if [ -n "$last" ] && [ "$(git rev-parse "$last^{commit}" 2>/dev/null)" = "$(git rev-parse HEAD)" ]; then
+            echo "$last is main as it is: nothing to release."
+            exit 0
+          fi
+          n=$(( ${last##*.} + 1 )); [ -z "$last" ] && n=1
+          echo "Releasing $base.$n"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "n=$n" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        if: steps.version.outputs.n
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK
+        if: steps.version.outputs.n
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "build-tools;37.0.0" > /dev/null
+
+      - name: Signing key
+        if: steps.version.outputs.n
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::No SIGNING_KEYSTORE_B64 secret: see the top of fork-release.yml (and FORK.md)."
+            exit 1
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          {
+            echo "storeFile=$RUNNER_TEMP/release.jks"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > keystore.properties
+
+      - name: Build
+        if: steps.version.outputs.n
+        run: |
+          ./gradlew :app:testDebugUnitTest --tests 'com.prism.music.ytmd.*' --console=plain
+          ./gradlew :app:assembleRelease -PforkRevision=${{ steps.version.outputs.n }} --console=plain
+          apk=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify "$apk"
+          cp "$apk" Prism.apk
+
+      - name: Publish
+        if: steps.version.outputs.n
+        run: |
+          version="${{ steps.version.outputs.base }}.${{ steps.version.outputs.n }}"
+          tag="${{ steps.merge.outputs.tag }}"
+          {
+            echo "Upstream Prism ${{ steps.version.outputs.base }} with this fork's changes (YouTube Music Desktop output, see FORK.md)."
+            echo
+            if [ "v${{ steps.version.outputs.base }}" = "$tag" ]; then
+              echo "## Upstream's notes for $tag"
+              echo
+              gh api "repos/$UPSTREAM_REPO/releases/tags/$tag" --jq .body
+            fi
+          } > notes.md
+          gh release create "v$version" Prism.apk --target "$(git rev-parse HEAD)" --title "Prism $version (fork)" --notes-file notes.md --latest

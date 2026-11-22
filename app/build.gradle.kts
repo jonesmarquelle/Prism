@@ -47,6 +47,17 @@ android {
         buildConfigField("String", "LASTFM_API_KEY", "\"${localProps.getProperty("lastfm.apiKey", "")}\"")
         // Scrobbling (1.7.8) signs its requests with the API account's shared secret; without one it isn't offered.
         buildConfigField("String", "LASTFM_SECRET", "\"${localProps.getProperty("lastfm.secret", "")}\"")
+        // Fork: YouTube Music Desktop as a Prism Connect output (com.prism.music.ytmd). `-PnoYtmd` builds stock Prism.
+        buildConfigField("boolean", "YTMD", (!project.hasProperty("noYtmd")).toString())
+        // Fork: the in-app updater asks this repo's releases (`-PupdateRepo=owner/name` for another), which
+        // .github/workflows/fork-release.yml makes from each upstream release with the fork's changes merged in.
+        buildConfigField("String", "UPDATE_REPO", "\"${project.findProperty("updateRepo") ?: "jonesmarquelle/Prism"}\"")
+        // `-PforkRevision=N` (the release workflow): upstream's version plus the fork's own, 1.8.7.6 → 1.8.7.6.N, so the
+        // updater offers it over 1.8.7.6, and upstream's next (1.8.7.7, with the fork merged in) over it in turn.
+        project.findProperty("forkRevision")?.toString()?.toIntOrNull()?.let { n ->
+            versionName = "$versionName.$n"
+            versionCode = versionCode!! * 100 + n
+        }
     }
 
     // Releases are signed with the key in keystore.properties (gitignored, with the .jks beside it).
