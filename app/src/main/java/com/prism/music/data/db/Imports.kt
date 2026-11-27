@@ -132,6 +132,10 @@ interface ImportDao {
     @Query("SELECT * FROM import_matches WHERE status = 'REVIEW' ORDER BY title")
     fun reviewFlow(): Flow<List<ImportMatchEntity>>
 
+    /** Songs the listener passed over in "Needs a look" ("None of these"), to look at again (fork). */
+    @Query("SELECT * FROM import_matches WHERE status = 'SKIPPED' ORDER BY title")
+    fun skippedFlow(): Flow<List<ImportMatchEntity>>
+
     @Query("SELECT status, COUNT(*) AS n FROM import_matches GROUP BY status")
     fun statusFlow(): Flow<List<StatusCount>>
 

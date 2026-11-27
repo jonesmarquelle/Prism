@@ -19,6 +19,22 @@ package (clod-droid) keep working. Build with `-PnoYtmd` for stock Prism.
   phone's playhead with the PC, so lyrics stay in time. Playing, pausing or picking another song on the PC comes back
   to the phone. Songs YouTube Music doesn't have (files on the phone, podcasts by RSS) play on the phone meanwhile.
 
+## Also in this fork: "Needs a look", with a search
+
+Bring your history's **Needs a look** shows the three songs YouTube Music's search put first, which can all be remixes
+or remasters while the song itself is further down. In this fork:
+
+- Each card has **Search for it…**: it searches YouTube Music's songs with the song's name (edit it as you like), and
+  any result can be played or picked with **This one**.
+- The three suggestions put the track's own version first (the same title and version words, then a remaster of it,
+  then the rest), so the plain song isn't crowded out.
+- **Passed over** (under Matching, on Bring your history) lists the songs you said **None of these** to, which upstream
+  never shows again, so you can pick or search for them later.
+
+The code is in `ui/screens/ImportReviewSearch.kt` and `res/values/strings_import_review.xml`, with small hooks in
+`ui/screens/BringHistoryScreen.kt`, `data/imports/HistoryImports.kt`, `data/imports/TrackMatcher.kt`,
+`data/db/Imports.kt`, `ui/Nav.kt` and `MainActivity.kt`.
+
 ## On the PC
 
 In YTMD's settings, **Integrations**: turn on **Companion server**, and **Enable companion authorization** while

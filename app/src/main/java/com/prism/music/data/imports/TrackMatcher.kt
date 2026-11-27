@@ -176,7 +176,18 @@ class TrackMatcher(private val search: suspend (String) -> List<Song>) {
                 .any { note -> note.split(" ").any { w -> w.isNotEmpty() && w !in trackWords && w !in NOTE_WORDS && !w.all(Char::isDigit) } }
         }
 
+        /**
+         * [first], then the rest with the track's own version ahead (fork): the same title and version words first, then
+         * the same but for a remaster, then everything else (remixes, live, sped up…), each in YouTube's order. So the
+         * plain song isn't pushed out of the three by versions YouTube ranks above it.
+         */
         private fun top3(first: Scored?, rest: List<Scored>): List<Song> =
-            (listOfNotNull(first) + rest.filter { it !== first }).map { it.song }.distinctBy { it.id }.take(3)
+            (listOfNotNull(first) + rest.filter { it !== first }.sortedBy { versionOrder(it) }).map { it.song }.distinctBy { it.id }.take(3)
+
+        private fun versionOrder(s: Scored): Int = when {
+            s.titleOk && s.marksSame -> 0
+            s.titleOk && s.onlyRemaster -> 1
+            else -> 2
+        }
     }
 }

@@ -715,6 +715,7 @@ private fun PrismRoot(deepLink: MutableStateFlow<Uri?>) {
                         // 1.8.1: Bring your history, and its "Needs a look".
                         composable(Routes.BRING_HISTORY) { ScreenBackdrop(BackdropScreen.SETTINGS) { com.prism.music.ui.screens.BringHistoryScreen(bottomPadding) } }
                         composable(Routes.IMPORT_REVIEW) { ScreenBackdrop(BackdropScreen.SETTINGS) { com.prism.music.ui.screens.ImportReviewScreen(bottomPadding) } }
+                        composable(Routes.IMPORT_PASSED) { ScreenBackdrop(BackdropScreen.SETTINGS) { com.prism.music.ui.screens.ImportPassedScreen(bottomPadding) } }
                         composable(
                             Routes.RECOGNIZE + "?start={start}",
                             listOf(navArgument("start") { type = NavType.BoolType; defaultValue = false }),
