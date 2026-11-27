@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  "Needs a look" additions (this fork's own): a search for the right song, and the songs passed over. Kept out of
+  strings.xml so merges from upstream Prism don't conflict, and English only: the other languages fall back to these.
+-->
+<resources>
+    <string name="imp_search_for_it">Search for it…</string>
+    <string name="imp_search_hint">Song and artist</string>
+    <string name="imp_search_nothing">Nothing found. Try other words.</string>
+    <string name="imp_search_failed">Couldn\'t search. Check the connection and try again.</string>
+    <string name="imp_passed_over">Passed over</string>
+    <plurals name="imp_passed_over_count">
+        <item quantity="one">%1$s song you said none of these to</item>
+        <item quantity="other">%1$s songs you said none of these to</item>
+    </plurals>
+    <string name="imp_passed_over_subtitle">Pick the song each one is after all, or search for it</string>
+    <string name="imp_passed_over_empty">Nothing passed over</string>
+    <string name="imp_passed_over_empty_body">Songs you say \"None of these\" to in Needs a look wait here, in case you find them later.</string>
+</resources>

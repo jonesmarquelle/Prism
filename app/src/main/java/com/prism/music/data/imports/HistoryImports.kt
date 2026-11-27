@@ -143,6 +143,13 @@ class HistoryImports(private val c: AppContainer) {
     val summaries: Flow<List<com.prism.music.data.db.ImportSummary>> = c.db.imports().summariesFlow()
     val statuses: Flow<List<com.prism.music.data.db.StatusCount>> = c.db.imports().statusFlow()
     val review: Flow<List<com.prism.music.data.db.ImportMatchEntity>> = c.db.imports().reviewFlow()
+    /** Songs passed over in "Needs a look", to pick again (fork). */
+    val passedOver: Flow<List<com.prism.music.data.db.ImportMatchEntity>> = c.db.imports().skippedFlow()
+
+    /** A search of YouTube Music's songs for the listener's own pick in "Needs a look" (fork), as matching searches. */
+    suspend fun searchSongs(query: String): List<Song> = withContext(Dispatchers.IO) {
+        c.ytm.search(query, SearchFilter.SONGS).items.filterIsInstance<SongItem>().map { it.song }
+    }
 
     /** Reading files or Last.fm now: what's read so far (null when nothing is). */
     val reading = MutableStateFlow<Reading?>(null)

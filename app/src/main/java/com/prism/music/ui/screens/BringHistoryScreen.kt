@@ -337,6 +337,11 @@ fun BringHistoryScreen(bottomPadding: Dp) {
                     if (review > 0) Item(tr(R.string.imp_needs_a_look), trp(R.plurals.imp_needs_a_look_count, review, count(review)), onClick = { nav.go(Routes.IMPORT_REVIEW) }) {
                         Icon(PrismIcons.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
+                    // Fork: the songs passed over ("None of these"), to pick after all.
+                    val passed = byStatus[MatchStatus.SKIPPED] ?: 0
+                    if (passed > 0) Item(tr(R.string.imp_passed_over), trp(R.plurals.imp_passed_over_count, passed, count(passed)), onClick = { nav.go(Routes.IMPORT_PASSED) }) {
+                        Icon(PrismIcons.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                     Toggle(tr(R.string.imp_match_on_mobile), tr(R.string.imp_match_on_mobile_detail), mobile) { imports.setMatchOnMobile(it) }
                 }
             }
@@ -410,8 +415,9 @@ fun ImportReviewScreen(bottomPadding: Dp) {
     }
 }
 
+/** [passedOver]: on "Passed over" (fork), where "None of these" was said already. */
 @Composable
-private fun ReviewCard(m: ImportMatchEntity) {
+internal fun ReviewCard(m: ImportMatchEntity, passedOver: Boolean = false) {
     val c = LocalContainer.current
     val ui = LocalUi.current
     val candidates = remember(m.candidates) { HistoryImporter.candidatesOf(m) }
@@ -421,13 +427,15 @@ private fun ReviewCard(m: ImportMatchEntity) {
         candidates.forEach { s -> CandidateRow(s, onPlay = {
             c.player.playQueue(listOf(s), 0, QueueSource(QueueKind.SINGLE, s.title))
         }) { c.scope.launch { c.imports.fix(m.songKey, s) } } }
-        Item(tr(R.string.imp_none_of_these), null, onClick = { c.scope.launch { c.imports.fix(m.songKey, null) } }, icon = PrismIcons.Close)
+        // Fork: the right song may be past the three found (remixes and remasters first): search for it.
+        ReviewSearch(m)
+        if (!passedOver) Item(tr(R.string.imp_none_of_these), null, onClick = { c.scope.launch { c.imports.fix(m.songKey, null) } }, icon = PrismIcons.Close)
         Spacer(Modifier.size(ui.gap(2.dp)))
     }
 }
 
 @Composable
-private fun CandidateRow(s: Song, onPlay: () -> Unit, onPick: () -> Unit) {
+internal fun CandidateRow(s: Song, onPlay: () -> Unit, onPick: () -> Unit) {
     val ui = LocalUi.current
     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
         Artwork(s.thumbnail, Modifier.size(48.dp).clickable(onClick = onPlay), ui.smallArt, size = 120)

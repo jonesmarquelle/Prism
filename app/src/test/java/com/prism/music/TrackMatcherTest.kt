@@ -57,6 +57,20 @@ class TrackMatcherTest {
         assertEquals("four seconds off isn't the same master", MatchStatus.REVIEW, judge(t, song("b", "Bohemian Rhapsody", "Queen", 358)).status)
     }
 
+    /** Fork: the song itself isn't pushed out of the three by the remixes YouTube ranks above it. */
+    @Test fun thePlainSongComesBeforeRemixesAmongTheThree() {
+        val t = TrackToMatch("Midnight City", "M83", durationMs = 243_000)
+        val r = judge(
+            t,
+            song("remix1", "Midnight City (Eric Prydz Remix)", "M83", 400),
+            song("remix2", "Midnight City (Trentemøller Remix)", "M83", 380),
+            song("remaster", "Midnight City (Remastered)", "M83", 250),
+            song("plain", "Midnight City", "M83", 251),
+        )
+        assertEquals(MatchStatus.REVIEW, r.status)
+        assertEquals(listOf("remaster", "plain", "remix1"), r.candidates.map { it.id })
+    }
+
     @Test fun knockOffsNeverStandForTheSong() {
         val r = judge(blinding, song("k", "Blinding Lights (Karaoke Version)", "The Weeknd", 200), song("s", "Blinding Lights (Sped Up)", "The Weeknd", 200))
         assertEquals(MatchStatus.NONE, r.status)
